@@ -1,0 +1,52 @@
+dataset:
+  type: nuscenes
+  data_root: ./
+  num_agents_max: 10
+  past_steps: 8
+  future_steps: 12
+  num_polylines: 6
+  polyline_points: 20
+  dummy_train_size: 1000
+  dummy_val_size: 200
+
+model:
+  model_dim: 128
+  num_heads: 4
+  num_transformer_layers: 2
+  latent_dim: 32
+  num_goals: 6
+  num_candidates: 50
+  num_predictions: 6
+  state_dim: 4        # (x, y, vx, vy)
+  goal_embed_dim: 64
+  decoder_hidden_dim: 256
+  gat_heads: 4
+  gat_layers: 2
+  edge_dim: 3         # relative distance + relative velocity (2D)
+
+training:
+  epochs: 200
+  batch_size: 32
+  learning_rate: 1.0e-4
+  grad_clip: 1.0
+  teacher_forcing_ratio: 0.5
+  kl_anneal_epochs: 20
+  checkpoint_path: checkpoints/best_model.pt
+  early_stopping_patience: 15
+  loss_weights:
+    min_ade: 1.0
+    min_fde: 1.0
+    goal: 0.5
+    kl: 0.1
+    diversity: 0.5
+    nll: 0.5          # set > 0 to enable NLL loss
+
+logging:
+  use_wandb: false
+  project_name: trajectory
+  log_every: 1        # log every N epochs
+
+inference:
+  scene_json: null    # path to a JSON scene file; null uses DummyDataset
+  visualize: false
+  output_dir: outputs
