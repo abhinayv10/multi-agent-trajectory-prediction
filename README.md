@@ -303,6 +303,3 @@ pip install -r requirements.txt
 
 ---
 
-## License
-
-MIT — see `LICENSE` for details.
