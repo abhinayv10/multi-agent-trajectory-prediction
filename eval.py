@@ -28,35 +28,9 @@ from torch.utils.data import DataLoader
 # ---------------------------------------------------------------------------
 # Local imports
 # ---------------------------------------------------------------------------
-from data.dataset import DatasetFactory
+from data.dataset import DatasetFactory, build_dataloader
 from models.trajectory import TrajectoryModel
-from utils.metrics import (
-    compute_ade,
-    compute_diversity,
-    compute_fde,
-    compute_min_ade,
-    compute_min_fde,
-    compute_miss_rate,
-    compute_oracle_fde,
-)
-
-
-# ---------------------------------------------------------------------------
-# Collate helper (mirrors train.py)
-# ---------------------------------------------------------------------------
-
-def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate a list of scene dicts into a batched dict.
-
-    Each value is either stacked (tensors with a leading batch dim) or kept as
-    a list when shapes differ across scenes (e.g. variable-agent tensors).
-    We return lists here and let the model handle per-scene iteration.
-    """
-    keys = batch[0].keys()
-    collated: dict[str, Any] = {}
-    for k in keys:
-        collated[k] = [item[k] for item in batch]
-    return collated
+from utils.metrics import compute_all_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -71,88 +45,55 @@ def evaluate(
 ) -> dict[str, float]:
     """Run one full pass over *loader* and return aggregated metric dict.
 
-    Parameters
-    ----------
-    model   : trained TrajectoryModel (already moved to *device*)
-    loader  : DataLoader yielding batched scene dicts
-    device  : torch.device
-    cfg     : full config dict (used for future_steps, num_predictions, etc.)
+    Uses the same batched/padded collate path as training (via build_dataloader
+    / collate_scenes) and aggregates each batch's metrics weighted by its number
+    of valid agents. This gives a true agent-weighted average — a 10-agent scene
+    counts ten times a 1-agent scene — instead of the old per-scene micro-average.
 
     Returns
     -------
-    metrics : dict with keys
-        'ADE', 'FDE', 'MissRate', 'OracleFDE', 'Diversity'
+    metrics : dict with display keys ADE, FDE, minADE_6, minFDE_6, MissRate_6,
+        OracleFDE, Diversity
     """
     model.eval()
-
-    num_predictions: int = cfg["model"]["num_predictions"]
     miss_threshold: float = 2.0  # metres – standard nuScenes threshold
 
-    # Running sums for micro-averaging across scenes
-    sum_ade = 0.0
-    sum_fde = 0.0
-    sum_min_ade = 0.0
-    sum_min_fde = 0.0
-    sum_miss = 0.0
-    sum_oracle_fde = 0.0
-    sum_diversity = 0.0
-    num_scenes = 0
+    keys = ["ade", "fde", "min_ade", "min_fde", "miss_rate", "oracle_fde", "diversity"]
+    sums = {k: 0.0 for k in keys}
+    total_agents = 0
 
     with torch.no_grad():
         for batch in loader:
-            # Each element in the batch list is one scene
-            for scene_idx in range(len(batch["past"])):
-                past = torch.tensor(batch["past"][scene_idx], dtype=torch.float32, device=device).unsqueeze(0)           # (1, N, 8, 4)
-                future = torch.tensor(batch["future"][scene_idx], dtype=torch.float32, device=device).unsqueeze(0)       # (1, N, 12, 2)
-                mask = torch.tensor(batch["mask"][scene_idx], dtype=torch.bool, device=device).unsqueeze(0)              # (1, N)
-                map_poly = torch.tensor(batch["map_polylines"][scene_idx], dtype=torch.float32, device=device).unsqueeze(0)  # (1, P, L, 2)
+            outputs = model(batch, teacher_forcing_ratio=0.0)
 
-                batch_dict = {
-                    "past": past,
-                    "mask": mask,
-                    "map_polylines": map_poly,
-                }
-                
-                # Forward pass (teacher_forcing_ratio=0.0 forced at eval time)
-                outputs = model(
-                    batch=batch_dict,
-                    teacher_forcing_ratio=0.0,
-                )
-                predictions = outputs["predictions"]
-                scores = outputs["log_probs"]
+            preds = outputs["predictions"].cpu().numpy()
+            probs = outputs["log_probs"].cpu().numpy()
+            gt = batch["future"].cpu().numpy()
+            mask = batch["mask"].cpu().numpy().astype(bool)
+            vm = batch.get("valid_mask")
+            valid = vm.cpu().numpy() if vm is not None else None
 
-                ade = compute_ade(predictions, scores, future, mask)
-                fde = compute_fde(predictions, scores, future, mask)
-                min_ade = compute_min_ade(predictions, future, mask)
-                min_fde = compute_min_fde(predictions, future, mask)
-                miss = compute_miss_rate(
-                    predictions, future, mask, threshold=miss_threshold
-                )
-                oracle = compute_oracle_fde(predictions, future, mask)
-                div = compute_diversity(predictions, mask)
+            n_valid = int(mask.sum())
+            if n_valid == 0:
+                continue
 
-                sum_ade += ade
-                sum_fde += fde
-                sum_min_ade += min_ade
-                sum_min_fde += min_fde
-                sum_miss += miss
-                sum_oracle_fde += oracle
-                sum_diversity += div
-                num_scenes += 1
+            m = compute_all_metrics(preds, probs, gt, mask, miss_threshold, valid_mask=valid)
+            for k in keys:
+                sums[k] += m[k] * n_valid       # weight by valid-agent count
+            total_agents += n_valid
 
-    if num_scenes == 0:
-        raise RuntimeError("Validation loader returned zero scenes.")
+    if total_agents == 0:
+        raise RuntimeError("Validation loader returned zero valid agents.")
 
-    metrics = {
-        "ADE": sum_ade / num_scenes,
-        "FDE": sum_fde / num_scenes,
-        "minADE_6": sum_min_ade / num_scenes,
-        "minFDE_6": sum_min_fde / num_scenes,
-        "MissRate_6": sum_miss / num_scenes,
-        "OracleFDE": sum_oracle_fde / num_scenes,
-        "Diversity": sum_diversity / num_scenes,
+    return {
+        "ADE":        sums["ade"] / total_agents,
+        "FDE":        sums["fde"] / total_agents,
+        "minADE_6":   sums["min_ade"] / total_agents,
+        "minFDE_6":   sums["min_fde"] / total_agents,
+        "MissRate_6": sums["miss_rate"] / total_agents,
+        "OracleFDE":  sums["oracle_fde"] / total_agents,
+        "Diversity":  sums["diversity"] / total_agents,
     }
-    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -240,12 +181,11 @@ def main() -> None:
         else cfg["training"]["batch_size"]
     )
 
-    val_loader = DataLoader(
+    val_loader = build_dataloader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
-        collate_fn=collate_fn,
     )
 
     # ------------------------------------------------------------------

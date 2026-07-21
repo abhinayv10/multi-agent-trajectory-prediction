@@ -21,6 +21,8 @@ Public interface:
     DatasetFactory(config, split) -> Dataset
 """
 
+import warnings
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -44,6 +46,8 @@ def collate_scenes(batch):
             future        : (B, N_max, T_future, 2)
             mask          : (B, N_max)
             map_polylines : (B, P, L, 2)
+            valid_mask    : (B, N_max, T_future)  bool, True = real future step
+            polyline_mask : (B, P_max)            bool, True = real polyline
     """
     max_agents = max(s["past"].shape[0] for s in batch)
     max_polylines = max(s["map_polylines"].shape[0] for s in batch)
@@ -56,6 +60,10 @@ def collate_scenes(batch):
     future_out = torch.zeros(B, max_agents, T_future, 2)       # (B, N, 12, 2)
     mask_out = torch.zeros(B, max_agents, dtype=torch.bool)    # (B, N)
     poly_out = torch.zeros(B, max_polylines, L, 2)             # (B, P, L, 2)
+    # Per-timestep future validity; padded agents stay all-False.
+    valid_out = torch.zeros(B, max_agents, T_future, dtype=torch.bool)  # (B, N, T_future)
+    # Real vs padded polylines; padded polylines stay False.
+    poly_mask_out = torch.zeros(B, max_polylines, dtype=torch.bool)     # (B, P)
 
     for i, scene in enumerate(batch):
         N = scene["past"].shape[0]
@@ -64,24 +72,37 @@ def collate_scenes(batch):
         future_out[i, :N] = torch.as_tensor(scene["future"], dtype=torch.float32)
         mask_out[i, :N] = torch.as_tensor(scene["mask"], dtype=torch.bool)
         poly_out[i, :P] = torch.as_tensor(scene["map_polylines"], dtype=torch.float32)
+        poly_mask_out[i, :P] = True
+
+        # Backward compatible: if a sample lacks "valid_mask", treat every real
+        # agent's whole future as valid (all-True) so downstream code that does
+        # batch.get("valid_mask") keeps working.
+        vm = scene.get("valid_mask")
+        if vm is None:
+            valid_out[i, :N] = True
+        else:
+            valid_out[i, :N] = torch.as_tensor(vm, dtype=torch.bool)
 
     return {
         "past": past_out,
         "future": future_out,
         "mask": mask_out,
         "map_polylines": poly_out,
+        "valid_mask": valid_out,
+        "polyline_mask": poly_mask_out,
     }
 
 
-def build_dataloader(dataset, batch_size: int, shuffle: bool = True,
-                     num_workers: int = 0) -> DataLoader:
+def build_dataloader(dataset, batch_size, shuffle=False, num_workers=0,
+                     pin_memory=False, collate_fn=collate_scenes) -> DataLoader:
     """Wrap a dataset in a DataLoader with the custom collate function."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        collate_fn=collate_scenes,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn,
     )
 
 
@@ -186,22 +207,63 @@ class NuScenesDataset(Dataset):
         self.split         = split
 
         from nuscenes.nuscenes import NuScenes
-        from nuscenes.map_expansion.map_api import NuScenesMap
-
-        import numpy as np
-        import nuscenes.utils.map_mask as map_mask
-        def dummy_init(self, map_name, resolution=0.1):
-            self.map_name = map_name
-            self.resolution = resolution
-            self.map_mask = np.zeros((1, 1), dtype=np.uint8)
-        map_mask.MapMask.__init__ = dummy_init
 
         version = "v1.0-mini" if split in ["train", "val"] else "v1.0-trainval"
         self.nusc = NuScenes(version=version, dataroot=self.data_root, verbose=False)
-        
+
+        # Map polylines require the nuScenes map-expansion pack. Load lazily and
+        # defensively so a missing/broken expansion pack degrades to all-zero
+        # polylines (the previous behavior) instead of crashing the constructor.
         self.maps = {}
+        self._load_maps()
 
         self.sample_tokens = self._get_sample_tokens()
+
+    def _load_maps(self):
+        """Populate self.maps with one NuScenesMap per location found in the
+        logs.
+
+        Degrades gracefully: if the map-expansion API/pack is unavailable, warns
+        exactly once and leaves self.maps empty so __getitem__ falls back to
+        all-zero map_polylines rather than raising.
+        """
+        try:
+            from nuscenes.map_expansion.map_api import NuScenesMap
+        except Exception as exc:  # ImportError or any expansion-pack issue
+            warnings.warn(
+                "nuScenes map-expansion API unavailable "
+                f"({exc}); map_polylines will be all zeros. Install the maps "
+                "expansion pack to enable lane loading.",
+                RuntimeWarning,
+            )
+            return
+
+        known_locations = [
+            "singapore-onenorth",
+            "singapore-hollandvillage",
+            "singapore-queenstown",
+            "boston-seaport",
+        ]
+        # Only load maps for locations actually present in this split's logs.
+        try:
+            locations = {log["location"] for log in self.nusc.log}
+        except Exception:
+            locations = set(known_locations)
+
+        warned = False
+        for loc in sorted(locations):
+            try:
+                self.maps[loc] = NuScenesMap(dataroot=self.data_root, map_name=loc)
+            except Exception as exc:
+                if not warned:  # warn only once across all locations
+                    warnings.warn(
+                        f"Failed to load NuScenesMap for '{loc}' ({exc}); "
+                        "affected scenes will have all-zero map_polylines. "
+                        "Verify the maps expansion pack is installed under "
+                        f"'{self.data_root}/maps/expansion'.",
+                        RuntimeWarning,
+                    )
+                    warned = True
 
     def _get_sample_tokens(self):
         tokens = [s['token'] for s in self.nusc.sample]
@@ -252,11 +314,14 @@ class NuScenesDataset(Dataset):
                 "future": np.zeros((1, self.future_steps, 2), dtype=np.float32),
                 "mask": np.zeros(1, dtype=bool),
                 "map_polylines": np.zeros((self.num_polylines, self.polyline_pts, 2), dtype=np.float32),
+                "valid_mask": np.zeros((1, self.future_steps), dtype=bool),
             }
 
         past = np.zeros((N, self.past_steps, 4), dtype=np.float32)
         future = np.zeros((N, self.future_steps, 2), dtype=np.float32)
         mask = np.ones(N, dtype=bool)
+        # True where a real future annotation exists; False where padded/repeated.
+        valid_mask = np.zeros((N, self.future_steps), dtype=bool)
         
         for i, ann in enumerate(valid_anns):
             curr = ann
@@ -277,14 +342,19 @@ class NuScenesDataset(Dataset):
 
             curr = ann
             fut = []
+            fut_valid = []
             for _ in range(self.future_steps):
                 if curr['next']:
                     curr = self.nusc.get('sample_annotation', curr['next'])
+                    fut_valid.append(True)   # real future annotation
+                else:
+                    fut_valid.append(False)  # padded: last annotation repeated
                 fut.append(curr)
-                
+
             for t, f in enumerate(fut):
                 future[i, t, 0] = f['translation'][0]
                 future[i, t, 1] = f['translation'][1]
+                valid_mask[i, t] = fut_valid[t]
 
         map_polylines = np.zeros((self.num_polylines, self.polyline_pts, 2), dtype=np.float32)
         if nusc_map is not None:
@@ -312,6 +382,7 @@ class NuScenesDataset(Dataset):
             "future": future_norm,
             "mask": mask,
             "map_polylines": poly_norm,
+            "valid_mask": valid_mask,   # (N, future_steps) bool, True = real
         }
 
 

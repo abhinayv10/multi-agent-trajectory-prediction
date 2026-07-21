@@ -187,6 +187,17 @@ class Decoder(nn.Module):
 
         predicted_positions = []
 
+        # Draw all T teacher-forcing decisions once, up front, on the CPU.
+        # Doing this per-step with `torch.rand(1).item()` forced a device->host
+        # sync every timestep. When teacher forcing is inactive (eval, ratio 0,
+        # or no ground truth) we skip sampling entirely and never teacher-force,
+        # which matches the previous behaviour exactly (rand in [0,1) is never
+        # < 0.0).
+        if self.training and future_gt is not None and teacher_forcing_ratio > 0.0:
+            tf_flips = torch.rand(T) < teacher_forcing_ratio    # (T,) bool, CPU
+        else:
+            tf_flips = None
+
         for t in range(T):
             # Social attention: query = current hidden, keys = social embeddings
             hidden_3d   = hidden.reshape(B, N, -1)              # (B, N, H)
@@ -213,12 +224,8 @@ class Decoder(nn.Module):
             pos = prev_pos + delta_3d                           # (B, N, 2)
             predicted_positions.append(pos)
 
-            # Prepare next step input
-            use_gt = (
-                self.training
-                and future_gt is not None
-                and torch.rand(1).item() < teacher_forcing_ratio
-            )
+            # Prepare next step input (decision drawn before the loop)
+            use_gt = tf_flips is not None and bool(tf_flips[t])
             if use_gt and t < T - 1:
                 # Teacher forcing: use ground-truth delta
                 if t == 0:

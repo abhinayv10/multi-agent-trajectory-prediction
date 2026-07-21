@@ -179,7 +179,10 @@ class SocialGAT(nn.Module):
         pos_j = pos.unsqueeze(1)    # (B, 1, N, 2)
         rel_pos = pos_j - pos_i     # (B, N, N, 2)  pos_j - pos_i
 
-        dist = rel_pos.norm(dim=-1, keepdim=True)   # (B, N, N, 1)
+        # NOTE: use sqrt(sum(x^2) + eps) rather than .norm() — at zero distance
+        # (self-edges, co-located agents) norm/sqrt has a NaN gradient in the
+        # backward pass, which corrupts the whole GAT. The eps keeps it finite.
+        dist = torch.sqrt(rel_pos.pow(2).sum(-1, keepdim=True) + 1e-6)  # (B, N, N, 1)
 
         # Pairwise relative velocities
         vel_i = vel.unsqueeze(2)    # (B, N, 1, 2)

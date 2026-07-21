@@ -121,22 +121,15 @@ class MapEncoder(nn.Module):
         # 3. Polyline projection
         poly_feats = self.polyline_proj(poly_feats)             # (B, P, D)
 
-        # 4. Cross-attention: each agent attends over all polylines
-        # Query: (B*N, 1, D) → (B, N, D) after unsqueezing
-        # Key/Value: (B, P, D) must be expanded to (B*N, P, D)
-        agent_q = agent_emb.reshape(B * N, 1, D)               # (B*N, 1, D)
-        poly_kv = poly_feats.unsqueeze(1).expand(
-            B, N, P, D
-        ).reshape(B * N, P, D)                                  # (B*N, P, D)
-
+        # 4. Cross-attention: each agent attends over all polylines.
+        # batch_first MultiheadAttention accepts query (B, N, D) against
+        # key/value (B, P, D) directly — no need to replicate the polyline
+        # features N times into a (B*N, P, D) tensor.
         attn_out, _ = self.cross_attn(
-            query=agent_q,    # (B*N, 1, D)
-            key=poly_kv,      # (B*N, P, D)
-            value=poly_kv,    # (B*N, P, D)
-        )                                                        # (B*N, 1, D)
-
-        attn_out = attn_out.squeeze(1)                          # (B*N, D)
-        attn_out = attn_out.reshape(B, N, D)                    # (B, N, D)
+            query=agent_emb,  # (B, N, D)
+            key=poly_feats,   # (B, P, D)
+            value=poly_feats, # (B, P, D)
+        )                                                        # (B, N, D)
 
         # 5. Residual + norm
         map_emb = self.norm(attn_out + agent_emb)               # (B, N, D)

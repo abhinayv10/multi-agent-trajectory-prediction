@@ -12,11 +12,24 @@ Usage:
 
 import argparse
 import os
+import random
 import time
 import yaml
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+def set_seed(seed: int) -> None:
+    """Seed all RNGs (Python, NumPy, torch CPU + CUDA) for repeatable runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 from data.dataset import DatasetFactory, build_dataloader
 from models.trajectory import TrajectoryModel
@@ -67,6 +80,13 @@ class WarmupCosineScheduler:
     def get_last_lr(self):
         return [pg["lr"] for pg in self.optimizer.param_groups]
 
+    def state_dict(self):
+        return {"_epoch": self._epoch, "cosine": self.cosine.state_dict()}
+
+    def load_state_dict(self, state):
+        self._epoch = state["_epoch"]
+        self.cosine.load_state_dict(state["cosine"])
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -89,6 +109,24 @@ def log_epoch(epoch: int, total_epochs: int, loss_dict: dict,
 # ---------------------------------------------------------------------------
 # Training epoch
 # ---------------------------------------------------------------------------
+def get_teacher_forcing_ratio(epoch: int, config: dict) -> float:
+    """Linearly decay teacher forcing from its initial value toward a minimum
+    over `teacher_forcing_decay_epochs`, to reduce train/inference mismatch.
+
+    A constant ratio (the old behaviour) trains the autoregressive decoder in a
+    regime it never sees at inference. Decaying it closes that gap. Set
+    teacher_forcing_decay_epochs <= 0 (or omit) to keep the ratio constant.
+    """
+    t = config["training"]
+    start = t["teacher_forcing_ratio"]
+    end = t.get("teacher_forcing_min", 0.0)
+    decay_epochs = t.get("teacher_forcing_decay_epochs", 0)
+    if decay_epochs and decay_epochs > 0:
+        frac = min(1.0, max(0, epoch - 1) / decay_epochs)   # epoch is 1-indexed
+        return start + (end - start) * frac
+    return start
+
+
 def train_one_epoch(
     model: TrajectoryModel,
     loader,
@@ -98,7 +136,7 @@ def train_one_epoch(
     device: torch.device,
 ) -> dict:
     model.train()
-    teacher_forcing_ratio = config["training"]["teacher_forcing_ratio"]
+    teacher_forcing_ratio = get_teacher_forcing_ratio(epoch, config)
     grad_clip = config["training"]["grad_clip"]
 
     agg_losses = {}
@@ -142,7 +180,8 @@ def validate(
     model.eval()
 
     agg_losses = {}
-    all_preds, all_probs, all_gt, all_masks = [], [], [], []
+    all_preds, all_probs, all_gt, all_masks, all_valid = [], [], [], [], []
+    has_valid = True
     n_batches = 0
 
     for batch in loader:
@@ -157,6 +196,11 @@ def validate(
         all_probs.append(outputs["log_probs"].cpu())            # (B, N, K)
         all_gt.append(batch["future"].cpu())                    # (B, N, T, 2)
         all_masks.append(batch["mask"].cpu())                   # (B, N)
+        vm = batch.get("valid_mask")
+        if vm is None:
+            has_valid = False
+        else:
+            all_valid.append(vm.cpu())                          # (B, N, T)
 
     avg_losses = {k: v / max(n_batches, 1) for k, v in agg_losses.items()}
 
@@ -165,8 +209,11 @@ def validate(
     probs = torch.cat(all_probs, dim=0)                        # (N_total, N, K)
     gt    = torch.cat(all_gt,    dim=0)                        # (N_total, N, T, 2)
     masks = torch.cat(all_masks, dim=0)                        # (N_total, N)
+    valid = torch.cat(all_valid, dim=0).numpy() if has_valid and all_valid else None
 
-    metrics = compute_all_metrics(preds.numpy(), probs.numpy(), gt.numpy(), masks.numpy())
+    metrics = compute_all_metrics(
+        preds.numpy(), probs.numpy(), gt.numpy(), masks.numpy(), valid_mask=valid
+    )
     return avg_losses, metrics
 
 
@@ -177,11 +224,18 @@ def main():
     parser = argparse.ArgumentParser(description="Train trajectory prediction model")
     parser.add_argument("--config", type=str, default="config.yaml",
                         help="Path to config file")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to a checkpoint to resume training from")
     args = parser.parse_args()
 
     # Load config
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
+
+    # Reproducibility
+    seed = config.get("training", {}).get("seed", 0)
+    set_seed(seed)
+    print(f"[train] Random seed: {seed}")
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -192,15 +246,21 @@ def main():
     train_dataset = DatasetFactory(config, split="train")
     val_dataset   = DatasetFactory(config, split="val")
 
+    num_workers = config["training"].get("num_workers", 0)
+    pin_memory = torch.cuda.is_available()
     train_loader = build_dataloader(
         train_dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
     val_loader = build_dataloader(
         val_dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
     print(f"[train] Train: {len(train_dataset)} scenes | Val: {len(val_dataset)} scenes")
 
@@ -241,10 +301,28 @@ def main():
     patience = config["training"].get("early_stopping_patience", 15)
     best_val_loss = float("inf")
     epochs_no_improve = 0
+    start_epoch = 1
+
+    # Optional resume
+    if args.resume:
+        if os.path.isfile(args.resume):
+            ckpt = torch.load(args.resume, map_location=device)
+            model.load_state_dict(ckpt["model_state"])
+            if "optimizer" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            if "scheduler" in ckpt:
+                scheduler.load_state_dict(ckpt["scheduler"])
+            start_epoch = ckpt.get("epoch", 0) + 1
+            best_val_loss = ckpt.get("best_val_loss", float("inf"))
+            best_fde = ckpt.get("best_fde", float("inf"))
+            print(f"[train] Resumed from {args.resume} at epoch {start_epoch} "
+                  f"(best_val_loss={best_val_loss:.4f}, best_fde={best_fde:.4f})")
+        else:
+            print(f"[train] --resume path not found, starting fresh: {args.resume}")
 
     print(f"\n[train] Starting training for {total_epochs} epochs\n")
 
-    for epoch in range(1, total_epochs + 1):
+    for epoch in range(start_epoch, total_epochs + 1):
         t0 = time.time()
 
         train_losses = train_one_epoch(model, train_loader, optimizer, config, epoch, device)
@@ -267,28 +345,31 @@ def main():
                 if ratio > 1.3:
                     print(f"  [warning] Potential overfitting: Val loss is {ratio:.2f}x Train loss.")
 
-        # Early stopping based on validation loss
+        # Early stopping AND checkpointing key off the SAME signal (validation
+        # loss) so the saved "best" model is exactly the one early stopping
+        # considers best — they can no longer diverge.
         current_val_loss = val_losses.get("total", float("inf"))
         if current_val_loss < best_val_loss:
             best_val_loss = current_val_loss
+            best_fde = metrics["fde"]
             epochs_no_improve = 0
+            torch.save({
+                "epoch":         epoch,
+                "model_state":   model.state_dict(),
+                "optimizer":     optimizer.state_dict(),
+                "scheduler":     scheduler.state_dict(),
+                "best_val_loss": best_val_loss,
+                "best_fde":      best_fde,
+                "val_loss":      current_val_loss,
+                "config":        config,
+            }, ckpt_path)
+            print(f"  [checkpoint] Saved best model "
+                  f"(val_loss={best_val_loss:.4f}, FDE={best_fde:.4f}) → {ckpt_path}")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
                 print(f"  [early stopping] Validation loss hasn't improved for {patience} epochs. Stopping.")
                 break
-
-        # Save best checkpoint
-        if metrics["fde"] < best_fde:
-            best_fde = metrics["fde"]
-            torch.save({
-                "epoch":        epoch,
-                "model_state":  model.state_dict(),
-                "optimizer":    optimizer.state_dict(),
-                "best_fde":     best_fde,
-                "config":       config,
-            }, ckpt_path)
-            print(f"  [checkpoint] Saved best model (FDE={best_fde:.4f}) → {ckpt_path}")
 
         # Optional wandb logging
         if use_wandb:
@@ -303,6 +384,9 @@ def main():
                 wandb.log(log_data)
             except Exception:
                 pass
+
+    if use_wandb:
+        wandb.finish()
 
     print(f"\n[train] Training complete. Best FDE: {best_fde:.4f}")
     print(f"[train] Best checkpoint saved to: {ckpt_path}")

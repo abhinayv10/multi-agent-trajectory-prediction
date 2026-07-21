@@ -28,6 +28,8 @@ Public interface:
     forward(batch, teacher_forcing_ratio=0.5) -> dict
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -140,11 +142,14 @@ class TrajectoryModel(nn.Module):
         teacher_forcing_ratio: float = 0.0,
     ):
         """
-        Generate num_candidates trajectory candidates by iterating over
+        Generate exactly num_candidates trajectory candidates over
         (goal, latent_z) pairs.
 
-        Candidates per agent = num_goals * samples_per_goal
-        Default: 6 goals * ~8 samples ≈ 50 candidates
+        Candidate plan = num_goals * ceil(num_candidates/num_goals), truncated
+        to exactly num_candidates. Decoding is done in at most TWO batched
+        decoder calls (posterior/teacher-forced group + prior/free group) by
+        folding the candidate axis into the batch dimension. At eval there is
+        only the prior group -> exactly ONE decoder call.
 
         Returns:
             candidates  : (B, N, C, T, 2)
@@ -154,51 +159,141 @@ class TrajectoryModel(nn.Module):
         B, N, _ = context.shape
         T = self.config["dataset"]["future_steps"]              # 12
         K_g = self.num_goals
+        C = self.num_candidates                                 # exact total, e.g. 50
 
-        # Number of latent samples per goal
-        samples_per_goal = max(1, self.num_candidates // K_g)  # ~8
+        # Latent samples per goal. ceil so K_g * samples_per_goal >= C; the
+        # candidate plan below is truncated to exactly C afterwards (Task #6).
+        samples_per_goal = math.ceil(C / K_g)
 
         # Flatten for CVAE
         ctx_flat = context.reshape(B * N, -1)                   # (B*N, 256)
 
         # CVAE: get prior/posterior params and sample z
         post_z, prior_params, post_params = self.cvae(context, future_gt)
+        use_posterior = self.training and post_z is not None
 
-        all_trajs = []
+        # ------------------------------------------------------------------
+        # Build the per-candidate plan in the ORIGINAL goal-major order,
+        # capped at exactly C candidates. This is cheap (MLP + randn only);
+        # the expensive 12-step GRU decoding is done in at most two batched
+        # calls below.  For each candidate we record its goal index, its
+        # latent z (B, N, D_z), and whether it is the teacher-forced
+        # posterior candidate (s == 0 of each goal, training only).
+        # ------------------------------------------------------------------
+        goal_ids: list = []            # int goal index per candidate
+        z_list: list = []              # (B, N, D_z) latent per candidate
+        is_post: list = []             # bool: posterior (teacher-forced) candidate
 
         for g in range(K_g):
-            # Goal for this iteration: (B, N, 2)
-            goal_g = goal_coords[:, :, g, :]                    # (B, N, 2)
-
-            # Sample multiple latent vectors for this goal
+            # Fresh prior samples per goal (preserves per-goal independence).
             z_samples = self.cvae.sample_prior(ctx_flat, samples_per_goal)
             # z_samples: (B*N, S, D_z)
-
             for s in range(samples_per_goal):
-                if self.training and s == 0 and post_z is not None:
-                    z_s = post_z.reshape(B, N, -1)
+                if len(goal_ids) >= C:
+                    break
+                posterior = use_posterior and s == 0
+                if posterior:
+                    z_s = post_z.reshape(B, N, -1)                  # (B, N, D_z)
                 else:
                     z_s = z_samples[:, s, :].reshape(B, N, -1)      # (B, N, D_z)
-
-                traj = self.decoder(
-                    context=context,
-                    social_emb=social_emb,
-                    goal_coords=goal_g,
-                    z=z_s,
-                    mask=mask,
-                    future_gt=future_gt,
-                    teacher_forcing_ratio=teacher_forcing_ratio,
-                )                                                # (B, N, T, 2)
-
-                all_trajs.append(traj)
-
-                if len(all_trajs) >= self.num_candidates:
-                    break
-            if len(all_trajs) >= self.num_candidates:
+                goal_ids.append(g)
+                z_list.append(z_s)
+                is_post.append(posterior)
+            if len(goal_ids) >= C:
                 break
 
-        # Stack candidates: (B, N, C, T, 2)
-        candidates = torch.stack(all_trajs, dim=2)              # (B, N, C, T, 2)
+        # Partition candidate positions into the two groups.
+        #   POSTERIOR group: teacher-forced, prior=posterior latent, tf_ratio.
+        #   PRIOR/free group: prior latents, teacher_forcing_ratio = 0.0.
+        # Only teacher-force the posterior candidates. Prior samples must run
+        # free — teacher-forcing every candidate pulls them all toward the
+        # single ground-truth future and collapses the candidate diversity the
+        # best-of-K / diversity losses rely on.
+        post_positions  = [i for i, p in enumerate(is_post) if p]
+        prior_positions = [i for i, p in enumerate(is_post) if not p]
+
+        def _run_group(positions, tf_ratio, use_tf):
+            """Decode all candidates in `positions` with ONE decoder call by
+            folding the candidate axis into the batch dim: (B, Cg, N, ...) ->
+            (B*Cg, N, ...). Social attention inside the decoder stays over the
+            N-agent axis within each folded row, so every candidate copy is
+            independent and correct. Returns (B, Cg, N, T, 2)."""
+            Cg = len(positions)
+            # Expand context / social / mask across the candidate axis.
+            ctx_fold = (
+                context.unsqueeze(1)
+                .expand(B, Cg, N, context.shape[-1])
+                .reshape(B * Cg, N, -1)
+            )
+            soc_fold = (
+                social_emb.unsqueeze(1)
+                .expand(B, Cg, N, social_emb.shape[-1])
+                .reshape(B * Cg, N, -1)
+            )
+            mask_fold = mask.unsqueeze(1).expand(B, Cg, N).reshape(B * Cg, N)
+
+            # Per-candidate goals: gather (B, N, Cg, 2) then fold candidate axis.
+            gid = torch.as_tensor(
+                [goal_ids[i] for i in positions],
+                device=context.device,
+                dtype=torch.long,
+            )
+            goals_fold = (
+                goal_coords[:, :, gid, :]        # (B, N, Cg, 2)
+                .permute(0, 2, 1, 3)             # (B, Cg, N, 2)
+                .reshape(B * Cg, N, 2)
+            )
+
+            # Per-candidate latents: (B, Cg, N, D_z) -> (B*Cg, N, D_z).
+            z_fold = torch.stack(
+                [z_list[i] for i in positions], dim=1
+            ).reshape(B * Cg, N, -1)
+
+            # Teacher forcing only for the posterior group during training.
+            if use_tf and future_gt is not None:
+                fut_fold = (
+                    future_gt.unsqueeze(1)
+                    .expand(B, Cg, N, T, 2)
+                    .reshape(B * Cg, N, T, 2)
+                )
+            else:
+                fut_fold = None
+
+            traj = self.decoder(
+                context=ctx_fold,
+                social_emb=soc_fold,
+                goal_coords=goals_fold,
+                z=z_fold,
+                mask=mask_fold,
+                future_gt=fut_fold,
+                teacher_forcing_ratio=tf_ratio,
+            )                                                    # (B*Cg, N, T, 2)
+            return traj.reshape(B, Cg, N, T, 2)
+
+        # At most two decoder calls: posterior (train only) + prior. At eval
+        # post_positions is empty, so this is exactly ONE decoder call.
+        group_trajs = []
+        group_order: list = []
+        if post_positions:
+            group_trajs.append(
+                _run_group(post_positions, teacher_forcing_ratio, True)
+            )
+            group_order.extend(post_positions)
+        if prior_positions:
+            group_trajs.append(_run_group(prior_positions, 0.0, False))
+            group_order.extend(prior_positions)
+
+        # Concatenate along candidate axis (grouped order), then reorder back
+        # to the original goal-major candidate order via inverse permutation.
+        grouped = torch.cat(group_trajs, dim=1)                 # (B, C, N, T, 2)
+        inv = [0] * C
+        for p, orig in enumerate(group_order):
+            inv[orig] = p
+        inv_idx = torch.as_tensor(inv, device=context.device, dtype=torch.long)
+        candidates_bcnt = grouped.index_select(1, inv_idx)      # (B, C, N, T, 2)
+
+        # (B, C, N, T, 2) -> (B, N, C, T, 2) as the rest of the code expects.
+        candidates = candidates_bcnt.permute(0, 2, 1, 3, 4).contiguous()
         return candidates, prior_params, post_params
 
     def _rank_and_select(

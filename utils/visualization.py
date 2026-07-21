@@ -142,16 +142,19 @@ def plot_scene(
     K = predictions.shape[1]
     cmap = cm.Blues
 
-    # normalize scores to [0.3, 1.0] for colormap
+    # normalize scores to [0, 1] so that BOTH alpha and color intensity track
+    # confidence (more confident modes render darker AND more opaque).
     if scores is not None:
-        s = scores[agent_idx]  # (K,)
-        s_norm = (s - s.min()) / (s.max() - s.min() + 1e-8)
-        alphas = 0.3 + 0.7 * s_norm
+        s = np.asarray(scores[agent_idx], dtype=np.float32)  # (K,)
+        intensity = (s - s.min()) / (s.max() - s.min() + 1e-8)
     else:
-        alphas = np.linspace(0.4, 1.0, K)
+        # no scores: fall back to index order (last mode most prominent)
+        intensity = np.linspace(0.0, 1.0, K)
+
+    alphas = 0.3 + 0.7 * intensity
 
     for k in range(K):
-        color_val = 0.3 + 0.7 * (k / max(K - 1, 1))
+        color_val = 0.3 + 0.7 * float(intensity[k])
         color = cmap(color_val)
         ax.plot(
             predictions[agent_idx, k, :, 0],
@@ -177,7 +180,7 @@ def plot_scene(
 
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.savefig(save_path, dpi=150)
         print(f"[visualization] Saved to {save_path}")
     else:
         plt.show()

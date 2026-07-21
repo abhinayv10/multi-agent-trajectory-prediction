@@ -193,6 +193,10 @@ def print_inference_results(
     mask = results["mask"].cpu()                 # (N,)
 
     N = predictions.shape[0]
+    # Clamp to the number of modes the model actually returned — run_inference
+    # already slices to min(top_k, num_predictions), so top_k may exceed K here.
+    K = predictions.shape[1]
+    top_k = min(top_k, K)
     print(f"\n{'='*60}")
     print(f"  Inference Results  —  {N} agents, top-{top_k} predictions")
     print(f"{'='*60}")
