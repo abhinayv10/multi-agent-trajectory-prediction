@@ -213,7 +213,7 @@ tests/              pipeline invariants (every variant trains; CV is exact on li
 results/            aggregated tables (*.md) and raw summaries (*.json)
 release/            trained checkpoints, written locally by export_checkpoints.py (not in git)
 docs/               failure-case plots and the prediction GIF used in this README
-demo.py demo_pedestrian.py   interactive HTML pages for nuScenes-mini predictions
+demo.py demo_pedestrian.py   build interactive HTML pages locally (not in git: they embed nuScenes data)
 ```
 
 ## References

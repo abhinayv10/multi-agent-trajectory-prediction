@@ -43,3 +43,7 @@ data/nuscenes/
 Thumbs.db
 .idea/
 .vscode/
+
+# Demo pages embed nuScenes trajectories (derived data); built locally by demo.py / demo_pedestrian.py
+demo/index.html
+demo/full.html
