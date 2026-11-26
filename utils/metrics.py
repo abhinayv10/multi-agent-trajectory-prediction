@@ -308,3 +308,58 @@ def compute_all_metrics(
         "oracle_fde": compute_oracle_fde(predictions, ground_truth, mask, valid_mask),
         "diversity":  compute_diversity(predictions, mask),
     }
+
+# ---------------------------------------------------------------------------
+# Per-agent errors at several K (used by eval.py and the analysis scripts)
+# ---------------------------------------------------------------------------
+
+def per_agent_errors(
+    predictions: Array,    # (B, N, K, T, 2) sorted best-first
+    ground_truth: Array,   # (B, N, T, 2)
+    mask: Array,           # (B, N) bool — agents to score
+    valid_mask: Array = None,  # (B, N, T) bool
+    ks=(1, 6),
+) -> dict:
+    """
+    minADE@k / minFDE@k per scored agent, for every k in ks that is <= K.
+    Because predictions are sorted by confidence, @1 is the top-ranked mode
+    (a test of the ranking), @6 is best-of-6, and so on.
+
+    Returns:
+        {"min_ade_<k>": (M,), "min_fde_<k>": (M,)} for the M agents with mask True.
+    """
+    preds = _to_numpy(predictions)
+    gt = _to_numpy(ground_truth)
+    m = _to_numpy(mask).astype(bool)
+    vm = _to_numpy(valid_mask).astype(bool) if valid_mask is not None else None
+
+    l2 = np.linalg.norm(preds - gt[:, :, None], axis=-1)              # (B, N, K, T)
+    if vm is None:
+        ade = l2.mean(-1)
+        fde = l2[..., -1]
+    else:
+        w = vm[:, :, None, :].astype(np.float32)
+        ade = (l2 * w).sum(-1) / np.maximum(w.sum(-1), 1.0)
+        last = _last_valid_index(vm, l2.shape[-1])                       # (B, N)
+        fde = np.take_along_axis(l2, last[:, :, None, None].repeat(l2.shape[2], 2), -1)[..., 0]
+
+    out = {}
+    K = preds.shape[2]
+    for k in ks:
+        if k > K:
+            continue
+        out[f"min_ade_{k}"] = ade[:, :, :k].min(-1)[m]
+        out[f"min_fde_{k}"] = fde[:, :, :k].min(-1)[m]
+    return out
+
+
+def summarize_errors(errors: dict, miss_threshold: float = 2.0) -> dict:
+    """Means of per-agent errors plus miss rate (minFDE@k > threshold) per k."""
+    out = {}
+    for key, arr in errors.items():
+        if arr.size == 0:
+            continue
+        out[key] = float(arr.mean())
+        if key.startswith("min_fde_"):
+            out["miss_rate_" + key[len("min_fde_"):]] = float((arr > miss_threshold).mean())
+    return out

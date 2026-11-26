@@ -2,23 +2,38 @@
 train.py
 
 Purpose:
-    Main training script for the trajectory prediction model.
-    All hyperparameters are read from config.yaml.
-    Uses DatasetFactory so switching datasets requires only a config change.
+    Train a trajectory model (full model, ablation or LSTM baseline).
+    All hyperparameters come from a YAML config; any key can be overridden
+    from the command line, so experiments never need edited config copies.
+
+    The checkpoint kept is the epoch with the best validation
+    minADE@K + minFDE@K (K = model.num_predictions); early stopping watches
+    the same number. Validation latents are drawn with a fixed seed, so
+    epochs are compared on identical samples.
 
 Usage:
-    python train.py --config config.yaml
+    python train.py --config configs/eth_ucy.yaml
+    python train.py --config configs/eth_ucy.yaml \
+        --set dataset.test_scene=hotel model.use_social=false --seed 1 \
+        --checkpoint runs/eth_ucy/hotel/no_social/seed1/best.pt
 """
 
 import argparse
+import json
 import os
 import random
 import time
-import yaml
+
 import numpy as np
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from data.dataset import DatasetFactory, build_dataloader
+from models import build_model
+from utils.config import load_config
+from utils.losses import compute_total_loss
+from utils.metrics import per_agent_errors, summarize_errors
 
 
 # ---------------------------------------------------------------------------
@@ -31,15 +46,7 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-from data.dataset import DatasetFactory, build_dataloader
-from models.trajectory import TrajectoryModel
-from utils.losses import compute_total_loss
-from utils.metrics import compute_all_metrics
 
-
-# ---------------------------------------------------------------------------
-# Optional wandb — gracefully skipped if not installed
-# ---------------------------------------------------------------------------
 def try_import_wandb():
     try:
         import wandb
@@ -52,10 +59,7 @@ def try_import_wandb():
 # LR warmup wrapper
 # ---------------------------------------------------------------------------
 class WarmupCosineScheduler:
-    """
-    Linear warmup for `warmup_epochs`, then cosine annealing.
-    Wraps CosineAnnealingLR.
-    """
+    """Linear warmup for `warmup_epochs`, then cosine annealing."""
 
     def __init__(self, optimizer, warmup_epochs: int, total_epochs: int, base_lr: float):
         self.optimizer     = optimizer
@@ -67,13 +71,19 @@ class WarmupCosineScheduler:
             eta_min=base_lr * 0.01,
         )
         self._epoch = 0
+        if warmup_epochs > 0:
+            for pg in optimizer.param_groups:
+                pg["lr"] = base_lr / warmup_epochs
 
     def step(self):
         self._epoch += 1
-        if self._epoch <= self.warmup_epochs:
-            lr = self.base_lr * (self._epoch / max(self.warmup_epochs, 1))
+        if self._epoch < self.warmup_epochs:
+            lr = self.base_lr * ((self._epoch + 1) / self.warmup_epochs)
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr
+        elif self._epoch == self.warmup_epochs:
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = self.base_lr
         else:
             self.cosine.step()
 
@@ -89,34 +99,11 @@ class WarmupCosineScheduler:
 
 
 # ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-def log_epoch(epoch: int, total_epochs: int, loss_dict: dict,
-              metrics: dict, lr: float, elapsed: float):
-    """Print a formatted log line for each epoch."""
-    loss_str = "  ".join(
-        f"{k}={v:.4f}" for k, v in loss_dict.items() if k != "kl_weight"
-    )
-    metric_str = "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
-    print(
-        f"[Epoch {epoch:03d}/{total_epochs}]  "
-        f"lr={lr:.2e}  time={elapsed:.1f}s\n"
-        f"  LOSSES: {loss_str}\n"
-        f"  METRICS: {metric_str}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Training epoch
+# Train / validate
 # ---------------------------------------------------------------------------
 def get_teacher_forcing_ratio(epoch: int, config: dict) -> float:
     """Linearly decay teacher forcing from its initial value toward a minimum
-    over `teacher_forcing_decay_epochs`, to reduce train/inference mismatch.
-
-    A constant ratio (the old behaviour) trains the autoregressive decoder in a
-    regime it never sees at inference. Decaying it closes that gap. Set
-    teacher_forcing_decay_epochs <= 0 (or omit) to keep the ratio constant.
-    """
+    over `teacher_forcing_decay_epochs` (<= 0 keeps it constant)."""
     t = config["training"]
     start = t["teacher_forcing_ratio"]
     end = t.get("teacher_forcing_min", 0.0)
@@ -127,269 +114,201 @@ def get_teacher_forcing_ratio(epoch: int, config: dict) -> float:
     return start
 
 
-def train_one_epoch(
-    model: TrajectoryModel,
-    loader,
-    optimizer: optim.Optimizer,
-    config: dict,
-    epoch: int,
-    device: torch.device,
-) -> dict:
+def train_one_epoch(model, loader, optimizer, config, epoch, device) -> dict:
     model.train()
-    teacher_forcing_ratio = get_teacher_forcing_ratio(epoch, config)
+    tf_ratio = get_teacher_forcing_ratio(epoch, config)
     grad_clip = config["training"]["grad_clip"]
+    max_batches = config["training"].get("max_batches_per_epoch")
 
-    agg_losses = {}
-    n_batches = 0
-
+    agg, n_batches = {}, 0
     for batch in loader:
+        if max_batches and n_batches >= max_batches:
+            break
+        if not bool(batch.get("target_mask", batch["mask"]).any()):
+            continue
         optimizer.zero_grad()
-
-        # Forward pass
-        outputs = model(batch, teacher_forcing_ratio=teacher_forcing_ratio)
-
-        # Loss computation
+        outputs = model(batch, teacher_forcing_ratio=tf_ratio)
         total_loss, loss_dict = compute_total_loss(outputs, batch, config, epoch)
-
-        # Backward pass
+        if not torch.isfinite(total_loss):
+            print(f"  [warning] non-finite loss at epoch {epoch}; batch skipped")
+            continue
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
-
-        # Accumulate losses
         for k, v in loss_dict.items():
-            agg_losses[k] = agg_losses.get(k, 0.0) + v
+            agg[k] = agg.get(k, 0.0) + v
         n_batches += 1
-
-    # Average over batches
-    avg_losses = {k: v / max(n_batches, 1) for k, v in agg_losses.items()}
-    return avg_losses
+    return {k: v / max(n_batches, 1) for k, v in agg.items()}
 
 
-# ---------------------------------------------------------------------------
-# Validation epoch
-# ---------------------------------------------------------------------------
 @torch.no_grad()
-def validate(
-    model: TrajectoryModel,
-    loader,
-    config: dict,
-    epoch: int,
-    device: torch.device,
-) -> tuple:
+def validate(model, loader, config, epoch, device, seed: int = 12345) -> tuple:
+    """Validation losses + minADE/minFDE at K=1 and K=num_predictions."""
     model.eval()
-
-    agg_losses = {}
-    all_preds, all_probs, all_gt, all_masks, all_valid = [], [], [], [], []
-    has_valid = True
-    n_batches = 0
-
-    for batch in loader:
-        outputs = model(batch, teacher_forcing_ratio=0.0)
-        _, loss_dict = compute_total_loss(outputs, batch, config, epoch)
-
-        for k, v in loss_dict.items():
-            agg_losses[k] = agg_losses.get(k, 0.0) + v
-        n_batches += 1
-
-        all_preds.append(outputs["predictions"].cpu())          # (B, N, K, T, 2)
-        all_probs.append(outputs["log_probs"].cpu())            # (B, N, K)
-        all_gt.append(batch["future"].cpu())                    # (B, N, T, 2)
-        all_masks.append(batch["mask"].cpu())                   # (B, N)
-        vm = batch.get("valid_mask")
-        if vm is None:
-            has_valid = False
-        else:
-            all_valid.append(vm.cpu())                          # (B, N, T)
-
-    avg_losses = {k: v / max(n_batches, 1) for k, v in agg_losses.items()}
-
-    # Compute metrics on full validation set
-    preds = torch.cat(all_preds, dim=0)                        # (N_total, N, K, T, 2)
-    probs = torch.cat(all_probs, dim=0)                        # (N_total, N, K)
-    gt    = torch.cat(all_gt,    dim=0)                        # (N_total, N, T, 2)
-    masks = torch.cat(all_masks, dim=0)                        # (N_total, N)
-    valid = torch.cat(all_valid, dim=0).numpy() if has_valid and all_valid else None
-
-    metrics = compute_all_metrics(
-        preds.numpy(), probs.numpy(), gt.numpy(), masks.numpy(), valid_mask=valid
-    )
-    return avg_losses, metrics
+    devices = [device] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        K = config["model"]["num_predictions"]
+        agg, n_batches = {}, 0
+        errors = {}
+        for batch in loader:
+            outputs = model(batch, teacher_forcing_ratio=0.0)
+            _, loss_dict = compute_total_loss(outputs, batch, config, epoch)
+            for k, v in loss_dict.items():
+                agg[k] = agg.get(k, 0.0) + v
+            n_batches += 1
+            e = per_agent_errors(outputs["predictions"].cpu(), batch["future"],
+                                 batch["target_mask"], batch.get("valid_mask"), ks=(1, K))
+            for k, v in e.items():
+                errors.setdefault(k, []).append(v)
+    errors = {k: np.concatenate(v) for k, v in errors.items()}
+    metrics = summarize_errors(errors, config["evaluation"].get("miss_threshold", 2.0))
+    losses = {k: v / max(n_batches, 1) for k, v in agg.items()}
+    return losses, metrics
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Train trajectory prediction model")
-    parser.add_argument("--config", type=str, default="config.yaml",
-                        help="Path to config file")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a trajectory prediction model")
+    parser.add_argument("--config", type=str, default="configs/eth_ucy.yaml")
+    parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                        help="Config overrides, e.g. model.use_map=false")
+    parser.add_argument("--seed", type=int, default=None, help="Overrides training.seed")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Overrides training.checkpoint_path")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to a checkpoint to resume training from")
-    args = parser.parse_args()
+                        help="Checkpoint to resume training from")
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--threads", type=int, default=None,
+                        help="torch CPU threads (useful when running jobs in parallel)")
+    return parser.parse_args()
 
-    # Load config
-    with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
 
-    # Reproducibility
-    seed = config.get("training", {}).get("seed", 0)
+def main():
+    args = parse_args()
+    config = load_config(args.config, args.set)
+    if args.seed is not None:
+        config["training"]["seed"] = args.seed
+    if args.checkpoint is not None:
+        config["training"]["checkpoint_path"] = args.checkpoint
+    config.setdefault("evaluation", {})
+
+    if args.threads:
+        torch.set_num_threads(args.threads)
+    seed = config["training"].get("seed", 0)
     set_seed(seed)
-    print(f"[train] Random seed: {seed}")
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    print(f"[train] seed={seed} device={device}")
 
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[train] Using device: {device}")
+    if config["model"].get("type", "trajectory") == "cv":
+        raise SystemExit("[train] The constant-velocity baseline has no parameters; "
+                         "evaluate it directly with eval.py --set model.type=cv")
 
     # Datasets
-    print(f"[train] Loading dataset: {config['dataset']['type']}")
+    print(f"[train] dataset: {config['dataset']['type']}")
     train_dataset = DatasetFactory(config, split="train")
-    val_dataset   = DatasetFactory(config, split="val")
-
+    val_dataset = DatasetFactory(config, split="val")
     num_workers = config["training"].get("num_workers", 0)
-    pin_memory = torch.cuda.is_available()
-    train_loader = build_dataloader(
-        train_dataset,
-        batch_size=config["training"]["batch_size"],
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-    val_loader = build_dataloader(
-        val_dataset,
-        batch_size=config["training"]["batch_size"],
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-    print(f"[train] Train: {len(train_dataset)} scenes | Val: {len(val_dataset)} scenes")
+    pin_memory = device.type == "cuda"
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    batch_size = config["training"]["batch_size"]
+    budget = config["training"].get("max_agents_per_batch")
+    train_loader = build_dataloader(train_dataset, batch_size=batch_size, shuffle=True,
+                                    num_workers=num_workers, pin_memory=pin_memory,
+                                    generator=gen, max_agents_per_batch=budget)
+    val_loader = build_dataloader(val_dataset, batch_size=batch_size, shuffle=False,
+                                  num_workers=num_workers, pin_memory=pin_memory,
+                                  max_agents_per_batch=budget)
+    print(f"[train] train: {len(train_dataset)} scenes | val: {len(val_dataset)} scenes")
 
-    # Model
-    model = TrajectoryModel(config, device)
+    model = build_model(config, device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[train] Model parameters: {n_params:,}")
+    print(f"[train] model: {config['model'].get('type', 'trajectory')} ({n_params:,} params)")
 
-    # Optimizer
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=config["training"]["learning_rate"],
-    )
+    lr = config["training"]["learning_rate"]
+    optimizer = optim.Adam(model.parameters(), lr=lr,
+                           weight_decay=config["training"].get("weight_decay", 0.0))
+    total_epochs = config["training"]["epochs"]
+    scheduler = WarmupCosineScheduler(optimizer,
+                                      warmup_epochs=config["training"].get("warmup_epochs", 5),
+                                      total_epochs=total_epochs, base_lr=lr)
 
-    total_epochs  = config["training"]["epochs"]
-    warmup_epochs = 5
-
-    scheduler = WarmupCosineScheduler(
-        optimizer,
-        warmup_epochs=warmup_epochs,
-        total_epochs=total_epochs,
-        base_lr=config["training"]["learning_rate"],
-    )
-
-    # Optional wandb
     wandb = try_import_wandb()
-    use_wandb = config["logging"].get("use_wandb", False) and wandb is not None
+    use_wandb = config.get("logging", {}).get("use_wandb", False) and wandb is not None
     if use_wandb:
         wandb.init(project=config["logging"]["project_name"], config=config)
-        print("[train] Weights & Biases logging enabled")
 
-    # Checkpoint path
     ckpt_path = config["training"]["checkpoint_path"]
-    os.makedirs(os.path.dirname(ckpt_path) if os.path.dirname(ckpt_path) else ".", exist_ok=True)
+    os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
+    history_path = os.path.splitext(ckpt_path)[0] + "_history.json"
 
-    best_fde = float("inf")
-    log_every = config["logging"].get("log_every", 1)
+    K = config["model"]["num_predictions"]
+    sel_keys = (f"min_ade_{K}", f"min_fde_{K}")
     patience = config["training"].get("early_stopping_patience", 15)
-    best_val_loss = float("inf")
-    epochs_no_improve = 0
-    start_epoch = 1
+    best_score, epochs_no_improve, start_epoch = float("inf"), 0, 1
+    history = []
 
-    # Optional resume
     if args.resume:
-        if os.path.isfile(args.resume):
-            ckpt = torch.load(args.resume, map_location=device)
-            model.load_state_dict(ckpt["model_state"])
-            if "optimizer" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer"])
-            if "scheduler" in ckpt:
-                scheduler.load_state_dict(ckpt["scheduler"])
-            start_epoch = ckpt.get("epoch", 0) + 1
-            best_val_loss = ckpt.get("best_val_loss", float("inf"))
-            best_fde = ckpt.get("best_fde", float("inf"))
-            print(f"[train] Resumed from {args.resume} at epoch {start_epoch} "
-                  f"(best_val_loss={best_val_loss:.4f}, best_fde={best_fde:.4f})")
-        else:
-            print(f"[train] --resume path not found, starting fresh: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_score = ckpt.get("best_score", float("inf"))
+        print(f"[train] resumed from {args.resume} at epoch {start_epoch}")
 
-    print(f"\n[train] Starting training for {total_epochs} epochs\n")
-
+    log_every = config.get("logging", {}).get("log_every", 1)
+    t_start = time.time()
     for epoch in range(start_epoch, total_epochs + 1):
         t0 = time.time()
-
         train_losses = train_one_epoch(model, train_loader, optimizer, config, epoch, device)
         val_losses, metrics = validate(model, val_loader, config, epoch, device)
-
         scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
-        elapsed = time.time() - t0
+        lr_now = scheduler.get_last_lr()[0]
+        score = metrics[sel_keys[0]] + metrics[sel_keys[1]]
+        history.append({"epoch": epoch, "lr": lr_now, "time": time.time() - t0,
+                        "train": train_losses, "val": val_losses, "metrics": metrics})
 
         if epoch % log_every == 0:
-            log_epoch(epoch, total_epochs, val_losses, metrics, current_lr, elapsed)
-            
-            # Print overfit comparison
-            train_total = train_losses.get('total', 0)
-            val_total = val_losses.get('total', 0)
-            print(f"  TRAIN LOSS: {train_total:.4f} | VAL LOSS: {val_total:.4f}")
-            
-            if train_total > 0:
-                ratio = val_total / train_total
-                if ratio > 1.3:
-                    print(f"  [warning] Potential overfitting: Val loss is {ratio:.2f}x Train loss.")
+            m_str = "  ".join(f"{k}={v:.3f}" for k, v in metrics.items())
+            print(f"[epoch {epoch:03d}/{total_epochs}] lr={lr_now:.1e} "
+                  f"train={train_losses.get('total', 0):.3f} {m_str} ({time.time() - t0:.0f}s)",
+                  flush=True)
 
-        # Early stopping AND checkpointing key off the SAME signal (validation
-        # loss) so the saved "best" model is exactly the one early stopping
-        # considers best — they can no longer diverge.
-        current_val_loss = val_losses.get("total", float("inf"))
-        if current_val_loss < best_val_loss:
-            best_val_loss = current_val_loss
-            best_fde = metrics["fde"]
-            epochs_no_improve = 0
+        if score < best_score:
+            best_score, epochs_no_improve = score, 0
             torch.save({
-                "epoch":         epoch,
-                "model_state":   model.state_dict(),
-                "optimizer":     optimizer.state_dict(),
-                "scheduler":     scheduler.state_dict(),
-                "best_val_loss": best_val_loss,
-                "best_fde":      best_fde,
-                "val_loss":      current_val_loss,
-                "config":        config,
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "best_score": best_score,
+                "val_metrics": metrics,
+                "config": config,
             }, ckpt_path)
-            print(f"  [checkpoint] Saved best model "
-                  f"(val_loss={best_val_loss:.4f}, FDE={best_fde:.4f}) → {ckpt_path}")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
-                print(f"  [early stopping] Validation loss hasn't improved for {patience} epochs. Stopping.")
+                print(f"[train] early stopping: no improvement for {patience} epochs")
                 break
 
-        # Optional wandb logging
+        with open(history_path, "w") as fh:
+            json.dump(history, fh, indent=1)
         if use_wandb:
-            log_data = {
-                "epoch": epoch,
-                "lr": current_lr,
-                **{f"train/{k}": v for k, v in train_losses.items()},
-                **{f"val/{k}": v for k, v in val_losses.items()},
-                **{f"metrics/{k}": v for k, v in metrics.items()},
-            }
-            try:
-                wandb.log(log_data)
-            except Exception:
-                pass
+            wandb.log({"epoch": epoch, "lr": lr_now,
+                       **{f"train/{k}": v for k, v in train_losses.items()},
+                       **{f"val/{k}": v for k, v in val_losses.items()},
+                       **{f"metrics/{k}": v for k, v in metrics.items()}})
 
     if use_wandb:
         wandb.finish()
-
-    print(f"\n[train] Training complete. Best FDE: {best_fde:.4f}")
-    print(f"[train] Best checkpoint saved to: {ckpt_path}")
+    print(f"[train] done in {(time.time() - t_start) / 60:.1f} min; best val "
+          f"{sel_keys[0]}+{sel_keys[1]} = {best_score:.4f} -> {ckpt_path}")
 
 
 if __name__ == "__main__":

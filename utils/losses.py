@@ -11,7 +11,9 @@ Inputs / Outputs documented per function below.
 Public interface:
     min_ade_loss(predictions, ground_truth, mask) -> scalar tensor
     min_fde_loss(predictions, ground_truth, mask) -> scalar tensor
-    goal_loss(predicted_goals, goal_probs, ground_truth_endpoints) -> scalar tensor
+    goal_loss(goal_candidates, goal_refined, goal_logits, gt_endpoints, mask) -> scalar tensor
+    ranking_loss(all_log_probs, candidates, ground_truth, mask) -> scalar tensor
+    recon_loss(recon, ground_truth, mask) -> scalar tensor
     kl_loss(prior_params, posterior_params, kl_weight) -> scalar tensor
     diversity_loss(predictions) -> scalar tensor
     nll_loss(log_probs, predictions, ground_truth) -> scalar tensor
@@ -106,32 +108,71 @@ def min_fde_loss(
 
 
 def goal_loss(
-    predicted_goals: torch.Tensor,  # (B, N, K, 2) — top-K goal coords
-    goal_log_probs: torch.Tensor,   # (B, N, K)    — log-probabilities
-    ground_truth_endpoints: torch.Tensor,  # (B, N, 2)
+    goal_candidates: torch.Tensor,  # (B, N, C, 2) raw candidates
+    goal_refined: torch.Tensor,     # (B, N, C, 2) candidates + predicted offsets
+    goal_logits: torch.Tensor,      # (B, N, C)
+    gt_endpoints: torch.Tensor,     # (B, N, 2) last valid ground-truth position
     mask: torch.Tensor,             # (B, N) bool
 ) -> torch.Tensor:
     """
-    Encourages the highest-probability goal to be close to the true endpoint.
-
-    Uses the probability-weighted sum of L2 distances across goals as a
-    soft version of the loss (differentiable through the probabilities).
+    TNT-style goal loss: cross-entropy towards the candidate nearest to the
+    true endpoint, plus smooth-L1 regression of that candidate's offset.
 
     Returns:
         Scalar loss averaged over valid agents.
     """
-    # probability-weighted distance
-    probs = goal_log_probs.exp()                                # (B, N, K)
-    gt_exp = ground_truth_endpoints.unsqueeze(2).expand(
-        *ground_truth_endpoints.shape[:2], predicted_goals.shape[2], 2
-    )                                                           # (B, N, K, 2)
+    d = torch.norm(goal_candidates - gt_endpoints.unsqueeze(2), dim=-1)    # (B, N, C)
+    target = d.argmin(dim=-1)                                              # (B, N)
+    ce = F.cross_entropy(goal_logits.flatten(0, 1), target.flatten(), reduction="none")
+    ce = ce.view_as(target)
+    idx = target[..., None, None].expand(-1, -1, 1, 2)
+    best = goal_refined.gather(2, idx).squeeze(2)                          # (B, N, 2)
+    reg = F.smooth_l1_loss(best, gt_endpoints, reduction="none").sum(-1)   # (B, N)
+    m = mask.float()
+    return ((ce + reg) * m).sum() / (m.sum() + 1e-8)
 
-    dist = torch.norm(predicted_goals - gt_exp, dim=-1)        # (B, N, K)
-    weighted = (probs * dist).sum(dim=-1)                       # (B, N)
 
-    masked = weighted * mask.float()
-    loss = masked.sum() / (mask.float().sum() + 1e-8)
-    return loss
+def ranking_loss(
+    all_log_probs: torch.Tensor,  # (B, N, C) log-softmax scores of the candidates
+    candidates: torch.Tensor,     # (B, N, C, T, 2)
+    ground_truth: torch.Tensor,   # (B, N, T, 2)
+    mask: torch.Tensor,           # (B, N) bool
+    valid_mask: torch.Tensor = None,
+    temperature: float = 0.0,
+) -> torch.Tensor:
+    """
+    Cross-entropy that teaches the ranker to put the candidates with the
+    lowest ADE first. This is what makes minADE@1 / minFDE@1 meaningful.
+
+    temperature > 0 uses soft targets softmax(-ADE / temperature): among many
+    similar samples the single argmin is close to a random label, while the
+    soft target says "closer is better" consistently. temperature = 0 is the
+    hard argmin target.
+    """
+    l2 = torch.norm(candidates - ground_truth.unsqueeze(2), dim=-1)        # (B, N, C, T)
+    if valid_mask is not None:
+        vm = valid_mask.to(l2.dtype).unsqueeze(2)
+        ade = (l2 * vm).sum(-1) / (vm.sum(-1) + 1e-8)
+    else:
+        ade = l2.mean(-1)
+    if temperature > 0:
+        target = F.softmax(-ade.detach() / temperature, dim=-1)            # (B, N, C)
+        nll = -(target * all_log_probs).sum(-1)                            # (B, N)
+    else:
+        target = ade.argmin(dim=-1).detach()                               # (B, N)
+        nll = -all_log_probs.gather(2, target.unsqueeze(-1)).squeeze(-1)   # (B, N)
+    m = mask.float()
+    return (nll * m).sum() / (m.sum() + 1e-8)
+
+
+def recon_loss(
+    recon: torch.Tensor,          # (B, N, T, 2) guided (posterior) reconstruction
+    ground_truth: torch.Tensor,   # (B, N, T, 2)
+    mask: torch.Tensor,
+    valid_mask: torch.Tensor = None,
+) -> torch.Tensor:
+    """ADE of the guided candidate (trains the CVAE posterior + decoder)."""
+    return min_ade_loss(recon.unsqueeze(2), ground_truth, mask, valid_mask)
 
 
 def kl_loss(
@@ -283,19 +324,12 @@ def compute_total_loss(
     epoch: int,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Combines all individual losses using weights from config.
+    Combines all losses using config["training"]["loss_weights"]. Terms whose
+    inputs a model does not produce (e.g. goals for the LSTM baseline, KL with
+    the CVAE ablated) are skipped.
 
-    Args:
-        outputs : dict from model forward pass with keys:
-            predictions      : (B, N, K, T, 2)
-            goal_coords      : (B, N, K_g, 2)
-            goal_log_probs   : (B, N, K_g)
-            prior_params     : (mu, logvar) each (B*N, D)
-            posterior_params : (mu, logvar) each (B*N, D)  — None at inference
-            log_probs        : (B, N, K)
-        batch  : dict from DataLoader with keys: future, mask
-        config : full config dict
-        epoch  : current epoch for KL annealing
+    Losses are averaged over *target* agents (batch["target_mask"]); other
+    valid agents only serve as social context.
 
     Returns:
         total_loss : scalar tensor
@@ -304,91 +338,58 @@ def compute_total_loss(
     w = config["training"]["loss_weights"]
     anneal_epochs = config["training"]["kl_anneal_epochs"]
 
-    predictions = outputs["predictions"]         # (B, N, K, T, 2)
-    
-    # Use all candidates for full trajectory training if available
-    train_candidates = outputs.get("all_candidates", predictions)
-    
-    ground_truth = batch["future"]               # (B, N, T, 2)
-    mask = batch["mask"]                         # (B, N)
-
-    # Optional per-timestep future validity mask (real vs padded steps)
-    valid_mask = batch.get("valid_mask")         # (B, N, T) bool or None
-
-    # Move ground truth to same device as predictions
-    ground_truth = ground_truth.to(predictions.device)
-    mask = mask.to(predictions.device)
+    predictions = outputs["predictions"]                                   # (B, N, K, T, 2)
+    dev = predictions.device
+    candidates = outputs.get("all_candidates")
+    if candidates is None:
+        candidates = predictions
+    ground_truth = batch["future"].to(dev)
+    mask = batch.get("target_mask", batch["mask"]).to(dev)
+    valid_mask = batch.get("valid_mask")
     if valid_mask is not None:
-        valid_mask = valid_mask.to(predictions.device)
+        valid_mask = valid_mask.to(dev)
 
     loss_dict = {}
-    total = torch.tensor(0.0, device=predictions.device)
+    total = torch.zeros((), device=dev)
 
-    # minADE
-    l_ade = min_ade_loss(train_candidates, ground_truth, mask, valid_mask)
-    loss_dict["min_ade"] = l_ade.item()
-    total = total + w["min_ade"] * l_ade
+    def add(name, value, weight):
+        nonlocal total
+        loss_dict[name] = value.item()
+        total = total + weight * value
 
-    # minFDE
-    l_fde = min_fde_loss(train_candidates, ground_truth, mask, valid_mask)
-    loss_dict["min_fde"] = l_fde.item()
-    total = total + w["min_fde"] * l_fde
+    # Winner-takes-all over the (prior) candidate pool.
+    add("min_ade", min_ade_loss(candidates, ground_truth, mask, valid_mask), w["min_ade"])
+    add("min_fde", min_fde_loss(candidates, ground_truth, mask, valid_mask), w["min_fde"])
 
-    # Goal loss
-    if "goal_coords" in outputs and outputs["goal_coords"] is not None:
-        gt_endpoints = ground_truth[:, :, -1, :]             # (B, N, 2)
-        l_goal = goal_loss(
-            outputs["goal_coords"],
-            outputs["goal_log_probs"],
-            gt_endpoints,
-            mask,
-        )
-        loss_dict["goal"] = l_goal.item()
-        total = total + w["goal"] * l_goal
+    if outputs.get("recon") is not None and w.get("recon", 0.0) > 0:
+        add("recon", recon_loss(outputs["recon"], ground_truth, mask, valid_mask), w["recon"])
 
-    # KL divergence (only during training when posterior is available)
-    if (outputs.get("posterior_params") is not None and
-            outputs.get("prior_params") is not None):
-        # epoch is 1-indexed in the training loop; pass epoch-1 so the first
-        # epoch starts at weight 0 (true warm-start) rather than 1/anneal_epochs.
+    if outputs.get("goal_logits") is not None and w.get("goal", 0.0) > 0:
+        from models.trajectory import last_valid_future
+        gt_end = last_valid_future(ground_truth, valid_mask)
+        add("goal", goal_loss(outputs["goal_candidates"], outputs["goal_refined"],
+                              outputs["goal_logits"], gt_end, mask), w["goal"])
+
+    if outputs.get("posterior_params") is not None and outputs.get("prior_params") is not None:
+        # epoch is 1-indexed; epoch-1 makes the first epoch a true warm start.
         kl_w = get_kl_weight(epoch - 1, anneal_epochs)
-        l_kl = kl_loss(
-            outputs["prior_params"],
-            outputs["posterior_params"],
-            kl_weight=kl_w,
-            mask=mask,
-        )
-        loss_dict["kl"] = l_kl.item()
+        add("kl", kl_loss(outputs["prior_params"], outputs["posterior_params"],
+                          kl_weight=kl_w, mask=mask), w["kl"])
         loss_dict["kl_weight"] = kl_w
-        total = total + w["kl"] * l_kl
 
-    # Diversity loss
-    l_div = diversity_loss(predictions, mask)
-    loss_dict["diversity"] = l_div.item()
-    total = total + w["diversity"] * l_div
+    if w.get("diversity", 0.0) > 0 and predictions.shape[2] > 1:
+        clamp = config["training"].get("diversity_clamp", DIVERSITY_CLAMP)
+        add("diversity", diversity_loss(predictions, mask, clamp=clamp), w["diversity"])
 
-    # NLL (optional). The candidate set and its log-probs MUST be a matched
-    # pair on the K axis, otherwise logsumexp broadcasts incorrectly. Prefer the
-    # full candidate pool (all_candidates + all_log_probs); fall back to the
-    # top-K pair (predictions + log_probs) when the full pool is unavailable.
-    if w.get("nll", 0.0) > 0.0:
-        if "all_candidates" in outputs and "all_log_probs" in outputs:
-            nll_candidates, nll_log_probs = outputs["all_candidates"], outputs["all_log_probs"]
-        elif "log_probs" in outputs:
-            nll_candidates, nll_log_probs = predictions, outputs["log_probs"]
-        else:
-            nll_candidates = nll_log_probs = None
-
-        if nll_log_probs is not None:
-            l_nll = nll_loss(
-                nll_log_probs,
-                nll_candidates,
-                ground_truth,
-                mask,
-                valid_mask,
-            )
-            loss_dict["nll"] = l_nll.item()
-            total = total + w["nll"] * l_nll
+    log_probs_all = outputs.get("all_log_probs")
+    if log_probs_all is not None:
+        if w.get("rank", 0.0) > 0:
+            tau = config["training"].get("rank_temperature", 0.0)
+            add("rank", ranking_loss(log_probs_all, candidates, ground_truth, mask, valid_mask,
+                                     temperature=tau), w["rank"])
+        if w.get("nll", 0.0) > 0:
+            add("nll", nll_loss(log_probs_all, candidates, ground_truth, mask, valid_mask),
+                w["nll"])
 
     loss_dict["total"] = total.item()
     return total, loss_dict

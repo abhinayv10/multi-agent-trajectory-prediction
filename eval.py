@@ -1,236 +1,201 @@
 """
 eval.py
--------
-Purpose : Load a saved checkpoint and run the full metric suite on the
-          validation split produced by DatasetFactory.
-Inputs  : --config <path>       path to config.yaml
-          --checkpoint <path>   path to a .pt checkpoint saved by train.py
-          --device <str>        'cpu' | 'cuda'  (default: auto-detect)
-Outputs : Prints a formatted summary table of ADE, FDE, MissRate, OracleFDE,
-          and Diversity metrics to stdout.  Returns nothing.
 
-Public interface
-----------------
-evaluate(model, loader, device, cfg) -> dict[str, float]
+Purpose:
+    Evaluate a checkpoint (or the parameter-free constant-velocity baseline)
+    on a dataset split and report:
+      * minADE@k / minFDE@k / miss rate@k for k in evaluation.ks
+        (predictions are sorted by confidence, so @1 measures the ranking),
+      * the same metrics broken down by agent type,
+      * inference latency per scene (batch size 1).
+
+    The model architecture comes from the config stored in the checkpoint;
+    --set overrides are applied on top (e.g. a different test scene).
+
+Usage:
+    python eval.py --checkpoint runs/eth_ucy/zara1/ours/seed0/best.pt
+    python eval.py --config configs/eth_ucy.yaml --set model.type=cv
+    python eval.py --checkpoint ... --split val --out results/run.json
 """
 
-from __future__ import annotations
-
 import argparse
+import json
 import os
 import sys
-from typing import Any
+import time
 
+import numpy as np
 import torch
-import yaml
-from torch.utils.data import DataLoader
 
-# ---------------------------------------------------------------------------
-# Local imports
-# ---------------------------------------------------------------------------
-from data.dataset import DatasetFactory, build_dataloader
-from models.trajectory import TrajectoryModel
-from utils.metrics import compute_all_metrics
+from data.dataset import AGENT_TYPE_NAMES, DatasetFactory, build_dataloader
+from models import build_model
+from utils.config import apply_overrides, load_config
+from utils.metrics import per_agent_errors, summarize_errors
 
 
-# ---------------------------------------------------------------------------
-# Core evaluation loop
-# ---------------------------------------------------------------------------
+def max_predictions(model, config) -> int:
+    """Largest K the model can produce."""
+    kind = config["model"].get("type", "trajectory")
+    if kind == "trajectory":
+        return model.num_pool
+    if kind == "lstm":
+        return model.num_modes
+    return 10_000   # constant velocity: any number of samples
 
-def evaluate(
-    model: TrajectoryModel,
-    loader: DataLoader,
-    device: torch.device,
-    cfg: dict[str, Any],
-) -> dict[str, float]:
-    """Run one full pass over *loader* and return aggregated metric dict.
 
-    Uses the same batched/padded collate path as training (via build_dataloader
-    / collate_scenes) and aggregates each batch's metrics weighted by its number
-    of valid agents. This gives a true agent-weighted average — a 10-agent scene
-    counts ten times a 1-agent scene — instead of the old per-scene micro-average.
+@torch.no_grad()
+def collect(model, loader, ks, seed=0, keep_predictions=False):
+    """Run the model over a loader and gather per-agent errors.
 
-    Returns
-    -------
-    metrics : dict with display keys ADE, FDE, minADE_6, minFDE_6, MissRate_6,
-        OracleFDE, Diversity
+    Returns dict with per-agent arrays "min_ade_<k>", "min_fde_<k>",
+    "agent_type" and, if keep_predictions, the batches + predictions.
     """
     model.eval()
-    miss_threshold: float = 2.0  # metres – standard nuScenes threshold
+    torch.manual_seed(seed)
+    k_max = max(ks)
+    errors, types, kept = {}, [], []
+    for batch in loader:
+        out = model(batch, teacher_forcing_ratio=0.0, num_predictions=k_max)
+        preds = out["predictions"].cpu()
+        tm = batch["target_mask"]
+        e = per_agent_errors(preds, batch["future"], tm, batch.get("valid_mask"), ks=ks)
+        for k, v in e.items():
+            errors.setdefault(k, []).append(v)
+        types.append(batch["agent_type"][tm].numpy())
+        if keep_predictions:
+            kept.append((batch, preds, out["log_probs"].cpu()))
+    res = {k: np.concatenate(v) for k, v in errors.items()}
+    res["agent_type"] = np.concatenate(types) if types else np.zeros(0, dtype=np.int64)
+    if keep_predictions:
+        res["batches"] = kept
+    return res
 
-    keys = ["ade", "fde", "min_ade", "min_fde", "miss_rate", "oracle_fde", "diversity"]
-    sums = {k: 0.0 for k in keys}
-    total_agents = 0
 
-    with torch.no_grad():
-        for batch in loader:
-            outputs = model(batch, teacher_forcing_ratio=0.0)
-
-            preds = outputs["predictions"].cpu().numpy()
-            probs = outputs["log_probs"].cpu().numpy()
-            gt = batch["future"].cpu().numpy()
-            mask = batch["mask"].cpu().numpy().astype(bool)
-            vm = batch.get("valid_mask")
-            valid = vm.cpu().numpy() if vm is not None else None
-
-            n_valid = int(mask.sum())
-            if n_valid == 0:
-                continue
-
-            m = compute_all_metrics(preds, probs, gt, mask, miss_threshold, valid_mask=valid)
-            for k in keys:
-                sums[k] += m[k] * n_valid       # weight by valid-agent count
-            total_agents += n_valid
-
-    if total_agents == 0:
-        raise RuntimeError("Validation loader returned zero valid agents.")
-
+@torch.no_grad()
+def time_inference(model, dataset, n_scenes, device, num_predictions=None):
+    """Mean / p95 forward latency per scene (batch size 1, after warm-up)."""
+    model.eval()
+    n = min(n_scenes, len(dataset))
+    if n == 0:
+        return {}
+    loader = build_dataloader(torch.utils.data.Subset(dataset, range(n)), batch_size=1)
+    batches = list(loader)
+    for b in batches[:5]:                     # warm-up
+        model(b, teacher_forcing_ratio=0.0, num_predictions=num_predictions)
+    times, agents = [], []
+    for b in batches:
+        t0 = time.perf_counter()
+        model(b, teacher_forcing_ratio=0.0, num_predictions=num_predictions)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        times.append((time.perf_counter() - t0) * 1000.0)
+        agents.append(int(b["mask"].sum()))
+    times = np.asarray(times)
     return {
-        "ADE":        sums["ade"] / total_agents,
-        "FDE":        sums["fde"] / total_agents,
-        "minADE_6":   sums["min_ade"] / total_agents,
-        "minFDE_6":   sums["min_fde"] / total_agents,
-        "MissRate_6": sums["miss_rate"] / total_agents,
-        "OracleFDE":  sums["oracle_fde"] / total_agents,
-        "Diversity":  sums["diversity"] / total_agents,
+        "ms_per_scene_mean": float(times.mean()),
+        "ms_per_scene_p95": float(np.percentile(times, 95)),
+        "agents_per_scene_mean": float(np.mean(agents)),
+        "scenes_timed": n,
+        "device": str(device),
+        "threads": torch.get_num_threads(),
     }
 
 
-# ---------------------------------------------------------------------------
-# Pretty-print helper
-# ---------------------------------------------------------------------------
-
-def print_metrics_table(metrics: dict[str, float]) -> None:
-    """Print a tidy two-column table of metric name → value."""
-    col_w = max(len(k) for k in metrics) + 2
-    sep = "+" + "-" * (col_w + 2) + "+" + "-" * 14 + "+"
-    print(sep)
-    print(f"| {'Metric':<{col_w}} | {'Value':>12} |")
-    print(sep)
-    for name, val in metrics.items():
-        print(f"| {name:<{col_w}} | {val:>12.4f} |")
-    print(sep)
+def summarize(res, ks, miss_threshold):
+    keys = [f"min_{m}_{k}" for k in ks for m in ("ade", "fde") if f"min_{m}_{k}" in res]
+    overall = summarize_errors({k: res[k] for k in keys}, miss_threshold)
+    by_type = {}
+    for t in np.unique(res["agent_type"]):
+        sel = res["agent_type"] == t
+        name = AGENT_TYPE_NAMES.get(int(t), str(int(t)))
+        by_type[name] = {"count": int(sel.sum()),
+                         **summarize_errors({k: res[k][sel] for k in keys}, miss_threshold)}
+    return overall, by_type
 
 
-# ---------------------------------------------------------------------------
-# CLI entry-point
-# ---------------------------------------------------------------------------
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Evaluate a saved TrajectoryModel checkpoint."
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config.yaml",
-        help="Path to config.yaml",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to the .pt checkpoint file to evaluate.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="'cpu' or 'cuda'. Defaults to CUDA if available.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=None,
-        help="Override batch size from config.",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-
-    # ------------------------------------------------------------------
-    # Load config
-    # ------------------------------------------------------------------
-    if not os.path.isfile(args.config):
-        print(f"[ERROR] Config file not found: {args.config}", file=sys.stderr)
-        sys.exit(1)
-
-    with open(args.config, "r") as fh:
-        cfg: dict[str, Any] = yaml.safe_load(fh)
-
-    # ------------------------------------------------------------------
-    # Device
-    # ------------------------------------------------------------------
-    if args.device is not None:
-        device = torch.device(args.device)
+def load_model(checkpoint, config_path, overrides, device):
+    """Build the model + config from a checkpoint (or a config, for CV)."""
+    if checkpoint:
+        if not os.path.isfile(checkpoint):
+            sys.exit(f"[eval] checkpoint not found: {checkpoint}")
+        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+        config = apply_overrides(ckpt["config"], overrides)
+        model = build_model(config, device)
+        model.load_state_dict(ckpt["model_state"])
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[eval] Using device: {device}")
+        config = load_config(config_path, overrides)
+        if config["model"].get("type", "trajectory") != "cv":
+            sys.exit("[eval] --checkpoint is required for trainable models")
+        model = build_model(config, device)
+    config.setdefault("evaluation", {})
+    return model.to(device), config
 
-    # ------------------------------------------------------------------
-    # Dataset & loader  (val split)
-    # ------------------------------------------------------------------
-    val_cfg = dict(cfg)  # shallow copy so we can override split
-    val_dataset = DatasetFactory(val_cfg, split="val")
 
-    batch_size: int = (
-        args.batch_size
-        if args.batch_size is not None
-        else cfg["training"]["batch_size"]
-    )
+def print_table(overall, by_type, ks):
+    cols = [f"{m}@{k}" for k in ks for m in ("minADE", "minFDE", "MR")]
+    def row(name, d, count=""):
+        vals = []
+        for k in ks:
+            for key in (f"min_ade_{k}", f"min_fde_{k}", f"miss_rate_{k}"):
+                vals.append(f"{d[key]:.3f}" if key in d else "-")
+        return f"| {name:<12} | {str(count):>6} | " + " | ".join(f"{v:>9}" for v in vals) + " |"
+    print("| " + "group".ljust(12) + " | " + "agents".rjust(6) + " | "
+          + " | ".join(c.rjust(9) for c in cols) + " |")
+    print(row("all", overall, sum(v["count"] for v in by_type.values())))
+    for name, d in by_type.items():
+        print(row(name, d, d["count"]))
 
-    val_loader = build_dataloader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-    )
 
-    # ------------------------------------------------------------------
-    # Model
-    # ------------------------------------------------------------------
-    model = TrajectoryModel(config=cfg, device=device).to(device)
+def main():
+    ap = argparse.ArgumentParser(description="Evaluate a trajectory model.")
+    ap.add_argument("--config", default="configs/eth_ucy.yaml")
+    ap.add_argument("--checkpoint", default=None)
+    ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE")
+    ap.add_argument("--split", default="test", help="test | val | train")
+    ap.add_argument("--out", default=None, help="Write results JSON here")
+    ap.add_argument("--device", default=None)
+    ap.add_argument("--threads", type=int, default=None)
+    ap.add_argument("--batch-size", type=int, default=None)
+    ap.add_argument("--no-timing", action="store_true")
+    args = ap.parse_args()
 
-    # ------------------------------------------------------------------
-    # Load checkpoint
-    # ------------------------------------------------------------------
-    if not os.path.isfile(args.checkpoint):
-        print(
-            f"[ERROR] Checkpoint not found: {args.checkpoint}", file=sys.stderr
-        )
-        sys.exit(1)
+    if args.threads:
+        torch.set_num_threads(args.threads)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model, config = load_model(args.checkpoint, args.config, args.set, device)
+    ev = config["evaluation"]
 
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    split = args.split
+    if split == "test" and config["dataset"]["type"] == "nuscenes":
+        split = "val"     # nuScenes test annotations are not public
+    dataset = DatasetFactory(config, split=split)
+    loader = build_dataloader(dataset, batch_size=args.batch_size or config["training"]["batch_size"],
+                              max_agents_per_batch=config["training"].get("max_agents_per_batch"))
 
-    # Support both raw state-dict saves and richer dicts written by train.py
-    if isinstance(checkpoint, dict) and ("model_state" in checkpoint or "model_state_dict" in checkpoint):
-        state_dict = checkpoint.get("model_state", checkpoint.get("model_state_dict"))
-        saved_epoch = checkpoint.get("epoch", "?")
-        saved_loss = checkpoint.get("val_loss", "?")
-        print(
-            f"[eval] Checkpoint: epoch={saved_epoch}, val_loss={saved_loss:.4f}"
-            if isinstance(saved_loss, float)
-            else f"[eval] Checkpoint: epoch={saved_epoch}"
-        )
-    else:
-        state_dict = checkpoint
+    k_cap = max_predictions(model, config)
+    ks = [k for k in ev.get("ks", [1, 6]) if k <= k_cap]
+    res = collect(model, loader, ks, seed=ev.get("seed", 0))
+    overall, by_type = summarize(res, ks, ev.get("miss_threshold", 2.0))
 
-    model.load_state_dict(state_dict)
-    print("[eval] Checkpoint loaded successfully.")
+    timing = {}
+    if not args.no_timing:
+        timing = time_inference(model, dataset, ev.get("timing_scenes", 200), device)
 
-    # ------------------------------------------------------------------
-    # Evaluate
-    # ------------------------------------------------------------------
-    print("[eval] Running evaluation …")
-    metrics = evaluate(model, val_loader, device, cfg)
+    print(f"[eval] {config['dataset']['type']} split={split} "
+          f"model={config['model'].get('type', 'trajectory')} scenes={len(dataset)}")
+    print_table(overall, by_type, ks)
+    if timing:
+        print(f"[eval] latency: {timing['ms_per_scene_mean']:.1f} ms/scene mean, "
+              f"{timing['ms_per_scene_p95']:.1f} ms p95 "
+              f"({timing['agents_per_scene_mean']:.1f} agents/scene, {timing['device']}, "
+              f"{timing['threads']} threads)")
 
-    # ------------------------------------------------------------------
-    # Report
-    # ------------------------------------------------------------------
-    print("\n=== Evaluation Results ===")
-    print_metrics_table(metrics)
+    if args.out:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w") as fh:
+            json.dump({"split": split, "ks": ks, "overall": overall, "by_type": by_type,
+                       "timing": timing, "checkpoint": args.checkpoint,
+                       "n_scenes": len(dataset), "config": config}, fh, indent=1)
 
 
 if __name__ == "__main__":

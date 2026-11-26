@@ -2,6 +2,9 @@ torch>=2.0.0
 numpy>=1.24.0
 matplotlib>=3.7.0
 pyyaml>=6.0
-scipy>=1.10.0
-wandb>=0.15.0  # optional; gracefully skipped if not installed
-nuscenes-devkit
+pillow>=9.0          # GIF export
+pytest>=7.0          # tests/
+# Optional:
+# wandb>=0.15.0          experiment logging (training.use_wandb)
+# nuscenes-devkit        only for full-trainval nuScenes splits or map polylines;
+#                        the v1.0-mini loader reads the JSON tables directly
