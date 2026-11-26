@@ -1,7 +1,7 @@
 """
 demo.py
 -------
-Runs the trained model on every nuScenes v1.0-mini validation scene and writes a
+Runs the trained model on every nuScenes v1.0-mini test scene (official mini_val) and writes a
 self-contained interactive page (demo/index.html) showing the inputs, the
 model's predictions and the error against ground truth.
 
@@ -33,7 +33,7 @@ def build(ckpt_path: str) -> dict:
     device = torch.device("cpu")
     model, cfg = load_model(ckpt_path, None, [], device)
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-    ds = DatasetFactory(cfg, split="val")
+    ds = DatasetFactory(cfg, split="test")
     model.eval()
 
     scenes, all_ade, all_fde, all_miss = [], [], [], []

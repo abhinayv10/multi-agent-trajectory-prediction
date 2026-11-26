@@ -165,3 +165,20 @@ def test_eth_ucy_windows():
     # Test windows are not rotated: velocities match position differences.
     v = (s["past"][:, -1, :2] - s["past"][:, -2, :2]) / 0.4
     assert np.allclose(v, s["past"][:, -1, 2:], atol=1e-4)
+
+
+def test_nuscenes_mini_splits_are_disjoint():
+    """Train, validation and test scenes must never overlap, and the test set
+    must be the official mini_val scenes (never used for model selection)."""
+    from data.dataset import NUSCENES_MINI_SPLITS as S
+    train, val, test = set(S["train"]), set(S["val"]), set(S["test"])
+    assert not (train & val) and not (train & test) and not (val & test)
+    assert test == {"scene-0103", "scene-0916"}
+    assert len(train | val) == 8   # together they are the official mini_train
+
+
+def test_eval_uses_test_split_for_nuscenes_mini():
+    """eval.py must not silently swap the mini test split for the validation split."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "eval.py"),
+               encoding="utf-8").read()
+    assert '!= "v1.0-mini"' in src

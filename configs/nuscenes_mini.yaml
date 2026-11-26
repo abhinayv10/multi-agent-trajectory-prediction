@@ -1,8 +1,9 @@
 # nuScenes v1.0-mini, pedestrians + cyclists as prediction targets.
 # Keyframes are 2 Hz (0.5 s): 5 observed steps (2 s incl. current frame)
 # -> 12 predicted steps (6 s), the nuScenes prediction-challenge horizon.
-# Official scene split: mini_train (8 scenes) / mini_val (2 scenes).
-# v1.0-mini is for pipeline validation: 2 val scenes are not a benchmark.
+# Scene split: train = 7 mini_train scenes, val = scene-1100 (held out from
+# mini_train), test = the 2 official mini_val scenes (never used for selection).
+# v1.0-mini is for pipeline validation: 2 test scenes are not a benchmark.
 dataset:
   type: nuscenes
   data_root: ./

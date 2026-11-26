@@ -5,7 +5,7 @@ Builds demo/index.html: a side-by-side view of one walking pedestrian.
 Left shows what actually happened, right shows what the trained model predicted.
 
 Cases are moving pedestrians (speed > 0.5 m/s) from the nuScenes-mini
-validation scenes; every scored agent has a full 6 s future. Eight cases are
+test scenes (official mini_val); every scored agent has a full 6 s future. Eight cases are
 chosen evenly across the accuracy ranking so the page is not cherry-picked.
 
 Usage: python demo_pedestrian.py [--checkpoint runs/nuscenes_mini/ours/seed0/best.pt]
@@ -32,7 +32,7 @@ def main() -> None:
     args = ap.parse_args()
     model, cfg = load_model(args.checkpoint, None, [], torch.device("cpu"))
     model.eval()
-    ds = DatasetFactory(cfg, split="val")
+    ds = DatasetFactory(cfg, split="test")
 
     cases = []
     for i in range(len(ds)):

@@ -166,8 +166,9 @@ def main():
     ev = config["evaluation"]
 
     split = args.split
-    if split == "test" and config["dataset"]["type"] == "nuscenes":
-        split = "val"     # nuScenes test annotations are not public
+    if (split == "test" and config["dataset"]["type"] == "nuscenes"
+            and config["dataset"].get("version", "v1.0-mini") != "v1.0-mini"):
+        split = "val"     # full nuScenes: test annotations are not public
     dataset = DatasetFactory(config, split=split)
     loader = build_dataloader(dataset, batch_size=args.batch_size or config["training"]["batch_size"],
                               max_agents_per_batch=config["training"].get("max_agents_per_batch"))

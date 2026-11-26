@@ -422,11 +422,16 @@ class ETHUCYDataset(Dataset):
 # nuScenes
 # ---------------------------------------------------------------------------
 
-# Official v1.0-mini scene split (nuscenes.utils.splits.mini_train / mini_val).
+# v1.0-mini scene split. The official mini_val scenes are the TEST set and are
+# never used for model selection. Validation (checkpoint choice, early stopping,
+# tuning) uses scene-1100, held out from the official mini_train: of the 8
+# mini_train scenes it is the one closest to 15% of the target agents (261 of
+# 1,808 target-agent samples), chosen from training-scene counts only.
 NUSCENES_MINI_SPLITS = {
     "train": ["scene-0061", "scene-0553", "scene-0655", "scene-0757",
-              "scene-0796", "scene-1077", "scene-1094", "scene-1100"],
-    "val": ["scene-0103", "scene-0916"],
+              "scene-0796", "scene-1077", "scene-1094"],
+    "val": ["scene-1100"],
+    "test": ["scene-0103", "scene-0916"],   # official mini_val
 }
 
 
@@ -457,8 +462,9 @@ class NuScenesDataset(Dataset):
     Frame: ego-vehicle pose at the current keyframe (origin = ego position,
     +x = ego heading).
 
-    Splits: scene-level. v1.0-mini uses the official mini_train / mini_val
-    split; trainval uses the devkit's create_splits_scenes (devkit required).
+    Splits: scene-level. v1.0-mini: train = 7 of the 8 official mini_train
+    scenes, val = the 8th (scene-1100), test = the official mini_val scenes.
+    trainval uses the devkit's create_splits_scenes (devkit required).
     """
 
     CONTEXT_PREFIXES = ("human.pedestrian", "vehicle.")

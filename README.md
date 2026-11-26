@@ -84,7 +84,9 @@ The same pattern appears on nuScenes. A cyclist riding faster than any cyclist i
 
 ### nuScenes v1.0-mini (pipeline check, not a benchmark)
 
-2 Hz keyframes: 5 observed steps (2 s including the current frame) → 12 predicted steps (6 s), the nuScenes prediction-challenge horizon. Train on the official `mini_train` split (8 scenes), test on `mini_val` (2 scenes). Targets are pedestrians, plus bicycles annotated with a rider, that have a full 6 s future. Vehicles serve as social context only.
+2 Hz keyframes: 5 observed steps (2 s including the current frame) → 12 predicted steps (6 s), the nuScenes prediction-challenge horizon. Train on 7 of the 8 official `mini_train` scenes, validate on the 8th (`scene-1100`, used for checkpoint choice and early stopping), and test on the official `mini_val` (2 scenes), which is never used for selection. Targets are pedestrians, plus bicycles annotated with a rider, that have a full 6 s future. Vehicles serve as social context only.
+
+> **These nuScenes numbers are not valid test results.** They come from runs that chose their best checkpoint and early-stopping point on `mini_val`, the same 2 scenes they were then tested on. The split has been fixed (above), but the models have not been re-trained yet. The table stays here until the re-run replaces it (`python scripts/run_benchmark.py --dataset nuscenes_mini`).
 
 | Method | Seeds | Type | Agents | minADE@1 | minFDE@1 | minADE@6 | minFDE@6 | MR@6 |
 |---|---|---|---|---|---|---|---|---|
@@ -119,7 +121,7 @@ The first version of this project reported numbers on nuScenes-mini. An audit of
 |---|---|---|
 | Timing | README said 8 past / 12 future steps at 4 Hz (2 s / 3 s) | nuScenes keyframes are 2 Hz and nothing was interpolated, so the model actually saw 3.5 s and predicted 6 s. Now stated correctly: 2 s → 6 s |
 | Agent types | No category filter: 50% cars, 9% barriers/cones, 27% pedestrians, 3% bicycles. 55% of agents moved less than 0.5 m | Only pedestrians and ridden bicycles are scored; vehicles are social context only |
-| Validation split | The last 10 samples of one scene that also appeared in training (neighbouring frames leak) | The official scene-level `mini_train` / `mini_val` split |
+| Validation split | The last 10 samples of one scene that also appeared in training (neighbouring frames leak). A later version used `mini_val` for both checkpoint selection and testing | Scene-level: 7 `mini_train` scenes for training, `scene-1100` for validation, the official `mini_val` for testing only |
 | Map | Map expansion absent → every polyline was zeros, so the map encoder only ever saw zeros | Stated explicitly. No map result is claimed |
 | Frame | Centred on "agent 0", which was just the first annotation in the file | Centred on the ego vehicle pose |
 | History padding | Missing history was filled by repeating the oldest box, with no mask | Padded steps are masked in the encoder |
