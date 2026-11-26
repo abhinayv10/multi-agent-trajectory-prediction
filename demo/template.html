@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trajectory Prediction Demo</title>
+<style>
+/* Layout: summary strip on top, then canvas (left) beside agent inspector (right); pipeline walkthrough below */
+:root{--bg:#f2f4f6;--panel:#fff;--fg:#14202a;--muted:#5b6873;--line:#d5dce2;--accent:#0b6e8a;--past:#7b8794;--gt:#1c8a43;--grid:#e3e8ec;
+--m0:#d62728;--m1:#ff7f0e;--m2:#8c564b;--m3:#9467bd;--m4:#1f77b4;--m5:#17becf;
+--mono:ui-monospace,'Cascadia Mono',Consolas,monospace;--sans:'Segoe UI',system-ui,sans-serif}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f161c;--panel:#17212a;--fg:#e4ebf0;--muted:#92a0ac;--line:#2a3640;--accent:#5cc3df;--past:#8b98a5;--gt:#5fd38a;--grid:#212c35;--m0:#ff6b6b;--m1:#ffa94d;--m2:#c49a8d;--m3:#b79ae0;--m4:#5aa9e6;--m5:#4fd8e6;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0f161c;--panel:#17212a;--fg:#e4ebf0;--muted:#92a0ac;--line:#2a3640;--accent:#5cc3df;--past:#8b98a5;--gt:#5fd38a;--grid:#212c35;--m0:#ff6b6b;--m1:#ffa94d;--m2:#c49a8d;--m3:#b79ae0;--m4:#5aa9e6;--m5:#4fd8e6;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--sans)}
+main{max-width:1200px;margin:0 auto;padding:20px 16px 56px;display:grid;gap:18px}
+h1{font-size:1.6rem;margin:0;line-height:1.2}
+h2{font:600 .75rem var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--accent);margin:0 0 10px}
+.sub{color:var(--muted);margin:4px 0 0;max-width:75ch}
+.strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:1px;background:var(--line);border:1px solid var(--line)}
+.strip div{background:var(--panel);padding:10px 14px;min-width:0}
+.strip b{display:block;font:600 1.4rem var(--mono);font-variant-numeric:tabular-nums}
+.strip span{font:.72rem var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.note{font-size:.85rem;color:var(--muted);margin:8px 0 0;max-width:90ch}
+.app{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:16px;align-items:start}
+@media(max-width:900px){.app{grid-template-columns:minmax(0,1fr)}}
+.panel{background:var(--panel);border:1px solid var(--line);padding:14px;min-width:0}
+.bar{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;margin-bottom:10px}
+label{font-size:.85rem;color:var(--muted);display:flex;gap:6px;align-items:center}
+select,button{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);padding:5px 10px;cursor:pointer;max-width:100%}
+button.primary{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:600;min-width:84px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+canvas{display:block;width:100%;height:auto;aspect-ratio:8/5;background:var(--bg);border:1px solid var(--line)}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:.8rem;color:var(--muted);margin-top:10px}
+.legend i{display:inline-block;width:18px;height:0;border-top:3px solid;vertical-align:middle;margin-right:6px}
+.tl{display:flex;gap:10px;align-items:center;margin-top:10px}
+.tl input{flex:1;accent-color:var(--accent);min-width:0}
+.tl output{font:.85rem var(--mono);min-width:9em;text-align:right;font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;font-size:.85rem;font-variant-numeric:tabular-nums}
+th{font:500 .7rem var(--mono);color:var(--muted);text-align:left;text-transform:uppercase;padding:4px 6px 4px 0}
+td{padding:5px 6px 5px 0;border-top:1px solid var(--line)}
+td.n,th.n{text-align:right}tr.best td{font-weight:600}
+.sw{display:inline-block;width:10px;height:10px;margin-right:6px}
+.pb{display:inline-block;height:8px;background:var(--accent);vertical-align:middle}
+.kv{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
+.kv div{border:1px solid var(--line);padding:8px 10px}
+.kv b{display:block;font:600 1.15rem var(--mono)}.kv span{font:.7rem var(--mono);color:var(--muted);text-transform:uppercase}
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
+.steps div{border-top:2px solid var(--accent);padding-top:8px}
+.steps b{font:600 .85rem var(--mono)}.steps p{margin:4px 0 0;color:var(--muted);font-size:.88rem}
+.hint{font-size:.8rem;color:var(--muted);margin:10px 0 0}
+</style></head>
+<body><main>
+<header><h1>Multi-Agent Trajectory Prediction</h1>
+<p class="sub">The trained model reads 2 seconds of history for every agent in a nuScenes scene and predicts six possible 6-second futures for each pedestrian and cyclist, each with a probability. Everything below is computed by running the checkpoint on the validation scenes.</p></header>
+
+<section><h2>Checkpoint results on the validation scenes</h2><div class="strip" id="strip"></div>
+<p class="note" id="note"></p></section>
+
+<section class="app">
+ <div class="panel">
+  <div class="bar">
+   <label>Scene <select id="scene"></select></label>
+   <label>Agent <select id="agent"></select></label>
+   <button class="primary" id="play" type="button">Play</button>
+   <label><input type="checkbox" id="cands"> 50 candidates</label>
+   <label><input type="checkbox" id="goals" checked> goals</label>
+   <label><input type="checkbox" id="others" checked> other agents</label>
+  </div>
+  <canvas id="cv" width="1120" height="700" role="img" aria-label="Top-down plot of past path, ground truth future and six predicted futures for the selected agent"></canvas>
+  <div class="tl"><span class="note" style="margin:0">time</span><input type="range" id="t" min="0" max="20" value="20" step="1" aria-label="Timeline"><output id="tout"></output></div>
+  <div class="legend">
+   <span><i style="border-color:var(--past);border-top-style:dashed"></i>observed past (2 s)</span>
+   <span><i style="border-color:var(--gt)"></i>ground truth future (6 s)</span>
+   <span><i style="border-color:var(--m0)"></i>6 predicted modes (opacity = probability)</span>
+   <span>&#9671; predicted goals</span>
+  </div>
+  <p class="hint">Press Play or drag the timeline: the agent moves and the real path is revealed while the predictions stay fixed at the last observed frame. Axes are metres in the ego-agent frame.</p>
+ </div>
+ <div class="panel" id="side"></div>
+</section>
+
+<section class="panel"><h2>How a prediction is made</h2><div class="steps">
+<div><b>Encode history</b><p>A Transformer reads each agent's 5 past steps (x, y, vx, vy) at 2 Hz, the nuScenes keyframe rate.</p></div>
+<div><b>Model interactions</b><p>A graph attention network lets each agent attend to its neighbours.</p></div>
+<div><b>Add map context</b><p>Cross-attention over lane polylines. This copy of the dataset has no map files, so the map input carries no lane information here.</p></div>
+<div><b>Propose goals and latents</b><p>A goal head scores endpoints; a CVAE samples latent variables to cover different behaviours.</p></div>
+<div><b>Decode and rank</b><p>A GRU decodes 20 candidate paths of 12 steps (0.5 s each); the top 6 by ranking score are returned.</p></div>
+</div></section>
+</main>
+<script>
+const D=/*DATA*/null;
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const MC=i=>css('--m'+i);
+const S=D.summary;
+$('strip').innerHTML=[[S.scenes,'scenes'],[S.agents,'agents scored'],[S.minADE+' m','mean minADE'],[S.minFDE+' m','mean minFDE'],[S.medADE+' m','median minADE'],[S.medFDE+' m','median minFDE'],[S.miss+'%','miss rate @2 m'],[S.epoch,'training epoch']].map(([v,l])=>'<div><b>'+v+'</b><span>'+l+'</span></div>').join('');
+$('note').textContent='minADE and minFDE take the best of K='+S.K+' modes. The mean is pulled up by fast, distant vehicles that appear as agents; the median shows typical error. The model has '+S.params.toLocaleString()+' parameters and was trained on nuScenes v1.0-mini only, so accuracy is modest.';
+
+let sc=D.scenes[0],ag=null,t=20,timer=null,step=10;
+$('scene').innerHTML=D.scenes.map(s=>'<option value="'+s.id+'">Scene '+(s.id+1)+' ('+s.agents.length+' agents)</option>').join('');
+function fillAgents(){
+  $('agent').innerHTML=sc.agents.map((a,i)=>'<option value="'+i+'">Agent '+a.id+(a.id===0?' (ego)':'')+' · minADE '+a.minADE+' m</option>').join('');
+  ag=sc.agents[0];
+}
+function stop(){if(timer){clearInterval(timer);timer=null}$('play').textContent='Play'}
+function setT(v){t=v;$('t').value=v;const s=(v-8)/4;$('tout').textContent=(s>=0?'+':'')+s.toFixed(2)+' s'+(v<8?' (past)':v===8?' (now)':'')}
+$('scene').onchange=e=>{sc=D.scenes[+e.target.value];fillAgents();stop();setT(20);side();draw()};
+$('agent').onchange=e=>{ag=sc.agents[+e.target.value];stop();setT(20);side();draw()};
+['cands','goals','others'].forEach(i=>$(i).onchange=draw);
+$('t').oninput=e=>{stop();setT(+e.target.value);draw()};
+$('play').onclick=()=>{
+  if(timer){stop();return}
+  if(t>=20)setT(0);
+  $('play').textContent='Pause';
+  timer=setInterval(()=>{if(t>=20){stop();return}setT(t+1);draw()},260);
+};
+
+function side(){
+  const a=ag;
+  let h='<h2>Agent '+a.id+' predictions</h2><div class="kv"><div><b>'+a.minADE+' m</b><span>minADE (best of '+S.K+')</span></div><div><b>'+a.minFDE+' m</b><span>minFDE (best of '+S.K+')</span></div></div>'+
+  '<table><tr><th>Mode</th><th>Prob</th><th class="n">ADE</th><th class="n">FDE</th></tr>';
+  a.prob.forEach((p,i)=>{h+='<tr class="'+(i===a.best?'best':'')+'"><td><span class="sw" style="background:var(--m'+i+')"></span>'+(i+1)+(i===a.best?' ★':'')+'</td><td><span class="pb" style="width:'+Math.max(2,p*60)+'px"></span> '+(p*100).toFixed(0)+'%</td><td class="n">'+a.ade[i].toFixed(1)+'</td><td class="n">'+a.fde[i].toFixed(1)+'</td></tr>'});
+  h+='</table><p class="hint">★ is the mode closest to ground truth. ADE is the mean distance over the future and FDE the distance at the final step, in metres. Only steps with a real annotation count ('+a.valid.reduce((x,y)=>x+y,0)+' of 12 for this agent).</p>';
+  $('side').innerHTML=h;
+}
+
+const cv=$('cv'),ctx=cv.getContext('2d');
+function near(o,a){const p=o.past[7],q=a.past[7];return Math.hypot(p[0]-q[0],p[1]-q[1])<45}
+function bounds(a){
+  const pts=[...a.past,...a.future,...a.pred.flat(),...a.goals];
+  if($('others').checked)sc.agents.forEach(o=>{if(o!==a&&near(o,a))pts.push(o.past[7])});
+  let x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;
+  pts.forEach(p=>{x0=Math.min(x0,p[0]);x1=Math.max(x1,p[0]);y0=Math.min(y0,p[1]);y1=Math.max(y1,p[1])});
+  const pad=Math.max(4,.12*Math.max(x1-x0,y1-y0));return[x0-pad,x1+pad,y0-pad,y1+pad];
+}
+function draw(){
+  const W=cv.width,H=cv.height,a=ag;
+  ctx.clearRect(0,0,W,H);
+  const[x0,x1,y0,y1]=bounds(a);
+  const cx=(x0+x1)/2,cy=(y0+y1)/2,sp=Math.max((x1-x0)/W,(y1-y0)/H);
+  const X=p=>W/2+(p[0]-cx)/sp,Y=p=>H/2-(p[1]-cy)/sp;
+  step=[1,2,5,10,20,50,100,200].find(n=>n/sp>=90)||200;
+  ctx.lineWidth=1;ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--muted');ctx.font='20px '+css('--mono');
+  for(let gx=Math.ceil(x0/step)*step;gx<x1;gx+=step){const px=X([gx,0]);ctx.beginPath();ctx.moveTo(px,0);ctx.lineTo(px,H);ctx.stroke();ctx.fillText(gx+' m',px+4,H-8)}
+  for(let gy=Math.ceil(y0/step)*step;gy<y1;gy+=step){const py=Y([0,gy]);ctx.beginPath();ctx.moveTo(0,py);ctx.lineTo(W,py);ctx.stroke();ctx.fillText(gy+' m',6,py-4)}
+  const line=(pts,col,w,dash,alpha,upto)=>{ctx.beginPath();ctx.setLineDash(dash||[]);ctx.globalAlpha=alpha==null?1:alpha;ctx.strokeStyle=col;ctx.lineWidth=w;ctx.lineJoin='round';
+    const n=upto==null?pts.length:upto;for(let i=0;i<n;i++){i?ctx.lineTo(X(pts[i]),Y(pts[i])):ctx.moveTo(X(pts[i]),Y(pts[i]))}ctx.stroke();ctx.setLineDash([]);ctx.globalAlpha=1};
+  const dot=(p,r,col,al)=>{ctx.globalAlpha=al==null?1:al;ctx.fillStyle=col;ctx.beginPath();ctx.arc(X(p),Y(p),r,0,7);ctx.fill();ctx.globalAlpha=1};
+  const origin=a.past[7];
+  if($('others').checked)sc.agents.forEach(o=>{if(o===a||!near(o,a))return;
+    line(o.past,css('--past'),2,[],.4);line([o.past[7],...o.future],css('--gt'),2,[],.3);dot(o.past[7],5,css('--past'),.7)});
+  if($('cands').checked)a.cand.forEach(c=>line([origin,...c],css('--accent'),1,[],.2));
+  if($('goals').checked)a.goals.forEach(g=>{ctx.save();ctx.translate(X(g),Y(g));ctx.rotate(Math.PI/4);ctx.strokeStyle=css('--accent');ctx.lineWidth=2;ctx.strokeRect(-6,-6,12,12);ctx.restore()});
+  const idx=[...a.prob.keys()].sort((i,j)=>a.prob[i]-a.prob[j]);
+  idx.forEach(i=>{const al=.3+.7*Math.min(1,a.prob[i]*2.5);
+    line([origin,...a.pred[i]],MC(i),i===a.best?4.5:2.8,[],al);dot(a.pred[i][11],i===a.best?9:6,MC(i),al)});
+  line(a.past,css('--past'),3.5,[10,7],1,Math.min(8,t+1));
+  const reveal=Math.max(0,t-8);
+  if(reveal>0)line([origin,...a.future],css('--gt'),4.5,[],1,reveal+1);
+  const pos=t<8?a.past[t]:(t===8?origin:a.future[t-9]);
+  dot(pos,10,css('--fg'));dot(pos,5,css('--bg'));
+  const len=step/sp;ctx.strokeStyle=css('--fg');ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(W-len-24,H-30);ctx.lineTo(W-24,H-30);ctx.stroke();
+  ctx.fillStyle=css('--fg');ctx.font='600 20px '+css('--mono');ctx.textAlign='right';ctx.fillText(step+' m',W-24,H-38);ctx.textAlign='left';
+}
+fillAgents();setT(20);side();draw();
+if(matchMedia)matchMedia('(prefers-color-scheme: dark)').addEventListener('change',draw);
+</script></body></html>

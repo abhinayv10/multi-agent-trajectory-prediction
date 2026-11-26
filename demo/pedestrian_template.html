@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pedestrian Prediction</title>
+<style>
+/* Layout: case picker and playback bar, two equal canvases side by side (reality | model), result line below */
+:root{--bg:#f2f4f6;--panel:#fff;--fg:#14202a;--muted:#5b6873;--line:#d5dce2;--accent:#0b6e8a;--past:#7b8794;--gt:#1c8a43;--grid:#e3e8ec;
+--m0:#d62728;--m1:#ff7f0e;--m2:#8c564b;--m3:#9467bd;--m4:#1f77b4;--m5:#17becf;
+--mono:ui-monospace,'Cascadia Mono',Consolas,monospace;--sans:'Segoe UI',system-ui,sans-serif}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f161c;--panel:#17212a;--fg:#e4ebf0;--muted:#92a0ac;--line:#2a3640;--accent:#5cc3df;--past:#8b98a5;--gt:#5fd38a;--grid:#212c35;--m0:#ff6b6b;--m1:#ffa94d;--m2:#c49a8d;--m3:#b79ae0;--m4:#5aa9e6;--m5:#4fd8e6;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0f161c;--panel:#17212a;--fg:#e4ebf0;--muted:#92a0ac;--line:#2a3640;--accent:#5cc3df;--past:#8b98a5;--gt:#5fd38a;--grid:#212c35;--m0:#ff6b6b;--m1:#ffa94d;--m2:#c49a8d;--m3:#b79ae0;--m4:#5aa9e6;--m5:#4fd8e6;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--sans)}
+main{max-width:1200px;margin:0 auto;padding:20px 16px 48px;display:grid;gap:16px}
+h1{font-size:1.5rem;margin:0;line-height:1.2}
+.sub{color:var(--muted);margin:4px 0 0;max-width:80ch}
+.bar{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center}
+label{font-size:.85rem;color:var(--muted);display:flex;gap:6px;align-items:center}
+select,button{font:inherit;background:var(--panel);color:var(--fg);border:1px solid var(--line);padding:6px 12px;cursor:pointer;max-width:100%}
+button.primary{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:600;min-width:90px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.tl{display:flex;gap:10px;align-items:center;flex:1;min-width:220px}
+.tl input{flex:1;accent-color:var(--accent);min-width:0}
+.tl output{font:.85rem var(--mono);min-width:10em;text-align:right;font-variant-numeric:tabular-nums}
+.pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+@media(max-width:760px){.pair{grid-template-columns:minmax(0,1fr)}}
+.box{background:var(--panel);border:1px solid var(--line);min-width:0}
+.box h2{margin:0;padding:10px 14px;border-bottom:1px solid var(--line);font:600 .78rem var(--mono);letter-spacing:.09em;text-transform:uppercase}
+.box h2 span{color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0;margin-left:8px}
+canvas{display:block;width:100%;height:auto;aspect-ratio:1/1;background:var(--bg)}
+.res{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);border:1px solid var(--line)}
+.res div{background:var(--panel);padding:10px 14px;min-width:0}
+.res b{display:block;font:600 1.25rem var(--mono);font-variant-numeric:tabular-nums}
+.res span{font:.72rem var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.legend{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:.82rem;color:var(--muted)}
+.legend i{display:inline-block;width:18px;height:0;border-top:3px solid;vertical-align:middle;margin-right:6px}
+.note{font-size:.82rem;color:var(--muted);margin:0;max-width:95ch}
+</style></head>
+<body><main>
+<header><h1>Pedestrian Prediction</h1>
+<p class="sub">Left: a real pedestrian from nuScenes walking. Right: what the trained model forecasts from only the first 2 seconds of that walk. Both views share the same scale and position.</p></header>
+
+<div class="bar">
+ <label>Case <select id="case"></select></label>
+ <button class="primary" id="play" type="button">Play</button>
+ <div class="tl"><input type="range" id="t" min="0" max="20" value="0" step="1" aria-label="Timeline"><output id="tout"></output></div>
+ <label><input type="checkbox" id="overlay"> overlay real path on prediction</label>
+</div>
+
+<div class="pair">
+ <div class="box"><h2>Reality <span>what actually happened</span></h2><canvas id="a" width="800" height="800" role="img" aria-label="Top-down view of the pedestrian actually walking"></canvas></div>
+ <div class="box"><h2>Model <span>6 predicted futures</span></h2><canvas id="b" width="800" height="800" role="img" aria-label="Top-down view of the model's six predicted paths for the same pedestrian"></canvas></div>
+</div>
+
+<div class="legend">
+ <span><i style="border-color:var(--past);border-top-style:dashed"></i>observed first 2 s (model input)</span>
+ <span><i style="border-color:var(--gt)"></i>real next 6 s</span>
+ <span><i style="border-color:var(--m0)"></i>model's 6 guesses (more opaque = more likely)</span>
+</div>
+
+<div class="res" id="res"></div>
+<p class="note" id="note"></p>
+</main>
+<script>
+const D=/*DATA*/null;
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const A=$('a').getContext('2d'),B=$('b').getContext('2d');
+let c=D.cases[0],t=0,timer=null,view=null;
+$('case').innerHTML=D.cases.map((k,i)=>'<option value="'+i+'">Pedestrian '+(i+1)+' · error '+k.minADE+' m</option>').join('');
+$('note').textContent='Cases are moving pedestrians with a full 6 s future (nuScenes keyframes are 2 Hz: 12 steps of 0.5 s), picked evenly across the accuracy ranking of '+D.pool+' candidates (best to worst), not hand-picked. They come from the two held-out validation scenes. The model is trained on nuScenes mini (8 scenes), so treat the numbers as a demo, not a benchmark.';
+function stop(){if(timer){clearInterval(timer);timer=null}$('play').textContent='Play'}
+function setT(v){t=v;$('t').value=v;const s=(v-8)/4;$('tout').textContent=(s>=0?'+':'')+s.toFixed(2)+' s'+(v<8?' · observing':v===8?' · now':' · future')}
+function setCase(i){c=D.cases[i];stop();setT(20);computeView();stats();draw()}
+$('case').onchange=e=>setCase(+e.target.value);
+$('t').oninput=e=>{stop();setT(+e.target.value);draw()};
+$('overlay').onchange=draw;
+$('play').onclick=()=>{
+  if(timer){stop();return}
+  if(t>=20)setT(0);
+  $('play').textContent='Pause';
+  timer=setInterval(()=>{if(t>=20){stop();return}setT(t+1);draw()},300);
+};
+function computeView(){
+  const pts=[...c.past,...c.future,...c.pred.flat()];
+  let x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;
+  pts.forEach(p=>{x0=Math.min(x0,p[0]);x1=Math.max(x1,p[0]);y0=Math.min(y0,p[1]);y1=Math.max(y1,p[1])});
+  const span=Math.max(x1-x0,y1-y0)*1.3+2;
+  view={cx:(x0+x1)/2,cy:(y0+y1)/2,span};
+}
+function stats(){
+  const k=c.best;
+  $('res').innerHTML=[[c.speed+' m/s','walking speed'],[c.minADE+' m','average error, closest guess'],[c.minFDE+' m','error at 6 s, closest guess'],[(c.prob[k]*100).toFixed(0)+'%','probability the model gave that guess']].map(([v,l])=>'<div><b>'+v+'</b><span>'+l+'</span></div>').join('');
+}
+function pane(ctx,right){
+  const W=ctx.canvas.width,sp=view.span/W;
+  const X=p=>W/2+(p[0]-view.cx)/sp,Y=p=>W/2-(p[1]-view.cy)/sp;
+  ctx.clearRect(0,0,W,W);
+  const step=[0.5,1,2,5,10,20].find(n=>n/sp>=110)||20;
+  ctx.lineWidth=1;ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--muted');ctx.font='20px '+css('--mono');
+  const x0=view.cx-view.span/2,y0=view.cy-view.span/2;
+  for(let g=Math.ceil(x0/step)*step;g<x0+view.span;g+=step){const p=X([g,0]);ctx.beginPath();ctx.moveTo(p,0);ctx.lineTo(p,W);ctx.stroke()}
+  for(let g=Math.ceil(y0/step)*step;g<y0+view.span;g+=step){const p=Y([0,g]);ctx.beginPath();ctx.moveTo(0,p);ctx.lineTo(W,p);ctx.stroke()}
+  const line=(pts,col,w,dash,al,n)=>{ctx.beginPath();ctx.setLineDash(dash||[]);ctx.globalAlpha=al==null?1:al;ctx.strokeStyle=col;ctx.lineWidth=w;ctx.lineJoin='round';ctx.lineCap='round';
+    const m=n==null?pts.length:n;for(let i=0;i<m;i++){i?ctx.lineTo(X(pts[i]),Y(pts[i])):ctx.moveTo(X(pts[i]),Y(pts[i]))}ctx.stroke();ctx.setLineDash([]);ctx.globalAlpha=1};
+  const dot=(p,r,col,al)=>{ctx.globalAlpha=al==null?1:al;ctx.fillStyle=col;ctx.beginPath();ctx.arc(X(p),Y(p),r,0,7);ctx.fill();ctx.globalAlpha=1};
+  const walker=p=>{dot(p,13,css('--fg'));dot(p,6,css('--bg'))};
+  const now=c.past[7];
+  // other road users, faint, move with time on the real pane only
+  c.others.forEach(o=>{
+    const full=[...o.past,...o.future];const upto=Math.min(t,19)+1;
+    if(!right){line(full,css('--past'),2,[],.28,upto);dot(full[Math.min(t,19)],5,css('--past'),.5)}
+    else{line(o.past,css('--past'),2,[],.28);dot(o.past[7],5,css('--past'),.5)}
+  });
+  // scale bar
+  const len=step/sp;ctx.strokeStyle=css('--fg');ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(W-len-24,W-30);ctx.lineTo(W-24,W-30);ctx.stroke();
+  ctx.fillStyle=css('--fg');ctx.font='600 20px '+css('--mono');ctx.textAlign='right';ctx.fillText(step+' m',W-24,W-38);ctx.textAlign='left';
+  // observed past
+  line(c.past,css('--past'),4,[10,8],1,Math.min(8,t+1));
+  if(!right){
+    const full=[now,...c.future];
+    if(t>8)line(full,css('--gt'),5,[],1,t-8+1);
+    walker(t<8?c.past[t]:t===8?now:c.future[t-9]);
+  }else{
+    if(t>=8){
+      const n=t-8, order=[...c.prob.keys()].sort((i,j)=>c.prob[i]-c.prob[j]);
+      order.forEach(i=>{const al=.3+.7*Math.min(1,c.prob[i]*2.5);
+        const pts=[now,...c.pred[i]];
+        if(n>0)line(pts,css('--m'+i),i===c.best?5:3,[],al,n+1);
+        dot(n===0?now:c.pred[i][n-1],i===c.best?9:6,css('--m'+i),al)});
+      if($('overlay').checked&&n>0)line([now,...c.future],css('--gt'),3,[3,6],.9,n+1);
+    }
+    walker(t<8?c.past[t]:now);
+  }
+}
+function draw(){pane(A,false);pane(B,true)}
+setCase(0);
+if(matchMedia)matchMedia('(prefers-color-scheme: dark)').addEventListener('change',draw);
+</script></body></html>

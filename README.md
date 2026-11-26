@@ -1,305 +1,224 @@
 # Multi-Agent Trajectory Prediction
 
-Intent-aware, socially-adaptive, multi-modal trajectory forecasting for autonomous driving — built in PyTorch.
+Multi-modal pedestrian and cyclist trajectory forecasting in PyTorch. The model combines a Transformer history encoder, a graph-attention social layer, a map encoder, TNT-style goal prediction, a CVAE, an autoregressive GRU decoder and a learned ranking network. It is evaluated against constant-velocity and LSTM baselines on the **ETH/UCY** benchmark (leave-one-scene-out) and on **nuScenes v1.0-mini**, with 3 seeds per configuration and ablations of each component.
+
+Every number on this page comes from `runs/**/test.json`, aggregated into [`results/`](results/) by the commands under [Reproduce](#reproduce). Trained checkpoints are not stored in git; `python scripts/export_checkpoints.py` writes them to `release/` after a run.
 
 ---
 
-## Overview
+## Results
 
-This project predicts **K = 6 future trajectories** for pedestrians and cyclists observed in a driving scene.  
-Given **2 seconds of motion history** (8 timesteps at 4 Hz), the model forecasts **3 seconds of future motion** (12 timesteps) in the ego-agent's local coordinate frame.
+![Predictions on the ZARA1 test set](docs/media/zara1_predictions.gif)
 
-The architecture combines a Transformer-based temporal encoder, a Graph Attention Network (GAT) social encoder, a cross-attention map encoder, a CVAE latent sampler, a goal predictor, and an autoregressive GRU decoder — all fused through a shared context vector.
+*Full model on the held-out ZARA1 scene. Blue = observed 3.2 s, green = true 4.8 s, orange = the top 3 predictions (thick = top-ranked).*
 
-The codebase incorporates native **NuScenes v1.0-mini dataset integration**, or can optionally use a `DummyDataset` for **zero-friction iteration**, enabling full training, evaluation, and inference with no external data. A single config change seamlessly swaps between NuScenes and dummy datasets without touching any other file.
+> **How much to trust these numbers.** The baselines were trained with the full protocol (15 epochs, 3 seeds). The full model has **seed 0 only, on a reduced budget**: ZARA1 and ZARA2 ran 6 epochs, ETH and HOTEL were stopped at epochs 9 and 4 by an interrupted session, and UNIV early-stopped. Its best checkpoints come from epochs 2–6. The ablations are single runs on ZARA1. These results show a working pipeline end to end, not a final benchmark. `python scripts/run_benchmark.py` completes the full protocol and skips finished runs.
 
----
+### ETH/UCY: average over the five leave-one-scene-out splits
 
-## Quick Start
+8 observed steps (3.2 s) → 12 predicted steps (4.8 s) at 2.5 Hz, using the Social-GAN split files. Errors are in metres. Predictions are sorted by the model's confidence, so **@1 is the top-ranked mode**, which measures the ranking; **@6 / @20 are best-of-K**. MR@6 is the share of agents whose minFDE@6 exceeds 2 m. Baselines show mean ± std over seeds 0–2.
 
-```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+| Method | Seeds | minADE@1 | minFDE@1 | minADE@6 | minFDE@6 | MR@6 | minADE@20 | minFDE@20 |
+|---|---|---|---|---|---|---|---|---|
+| Constant velocity | 3 | **0.53** | **1.15** | 0.45 | 0.95 | 0.13 | 0.42 | 0.86 |
+| LSTM enc-dec (20 modes) | 3 | 0.62 ± 0.02 | 1.32 ± 0.04 | **0.39 ± 0.01** | **0.76 ± 0.03** | **0.10 ± 0.00** | **0.26 ± 0.01** | **0.44 ± 0.02** |
+| Ours, full model (reduced budget) | 1 | 0.77 | 1.51 | 0.47 | 0.90 | 0.12 | 0.33 | 0.58 |
 
-# 2. Train (uses NuScenes v1.0-mini by default; set dataset.type to dummy for testing)
-python train.py --config config.yaml
+Per scene, minADE@6 / minFDE@6 (seed 0 for every row, so the columns compare like with like):
 
-# 3. Evaluate a checkpoint
-python eval.py --config config.yaml --checkpoint checkpoints/best_model.pt
+| Method | ETH | HOTEL | UNIV | ZARA1 | ZARA2 |
+|---|---|---|---|---|---|
+| Constant velocity | 0.98 / 2.06 | 0.27 / 0.51 | 0.42 / 0.91 | 0.34 / 0.73 | **0.26 / 0.55** |
+| LSTM enc-dec | **0.82 / 1.55** | **0.20 / 0.32** | **0.39 / 0.74** | **0.31 / 0.65** | 0.29 / 0.61 |
+| Ours (reduced budget) | 0.85 / 1.57 | 0.25 / 0.44 | 0.51 / 0.99 | 0.40 / 0.84 | 0.32 / 0.65 |
 
-# 4. Run inference on a random scene
-python inference.py --config config.yaml --checkpoint checkpoints/best_model.pt
+**Reading the results**
 
-# 5. Inference with visualization saved to file
-python inference.py --config config.yaml --checkpoint checkpoints/best_model.pt \
-    --save-plot outputs/scene.png
+- **The plain LSTM is the strongest model here.** It beats constant velocity on best-of-6 and best-of-20 (minFDE@6 0.76 vs 0.95 m). The under-trained full model sits between the two at best-of-6 (0.90 m minFDE@6). It beats constant velocity on ETH and HOTEL and falls behind on UNIV and ZARA1.
+- **No learned model beats constant velocity on its top-ranked guess** (minFDE@1: 1.15 m for CV, 1.32 m for the LSTM, 1.51 m for ours). Both models learn spread-out modes for best-of-K, and their rankers do not yet pick the most likely one. Without the @1 column this weakness would be invisible.
+- **Comparison with published work.** On the same split files, Social-GAN reports a best-of-20 of 0.58 / 1.18 m (ETH 0.81/1.52, HOTEL 0.72/1.61, UNIV 0.60/1.26, ZARA1 0.34/0.69, ZARA2 0.42/0.84; Gupta et al., CVPR 2018). The LSTM (0.26 / 0.44 m) and the full model (0.33 / 0.58 m) are both well below that, so the pipeline produces competitive best-of-20 numbers.
+- **Note on constant velocity:** Schöller et al. (RA-L 2020) report lower constant-velocity errors (0.39 / 0.83). Their table also re-evaluates Social-GAN at 0.59 m ADE on ETH, against 0.81 m in the Social-GAN paper, so their test pipeline differs from the split files used here. Their numbers are not directly comparable.
 
-# 6. Inference from a JSON scene file
-python inference.py --config config.yaml --checkpoint checkpoints/best_model.pt \
-    --scene my_scene.json --visualize
-```
+### Ablations (ZARA1, seed 0, same 6-epoch budget as the full model)
 
-All commands above are heavily tested out of the box with the **NuScenes v1.0-mini dataset** and the internal `DummyDataset`.
+<!-- ablation:start -->
+| Variant | minADE@1 | minFDE@1 | minADE@6 | minFDE@6 | minADE@20 | minFDE@20 | ΔminFDE@6 vs full |
+|---|---|---|---|---|---|---|---|
+| Full model | 0.80 | 1.63 | 0.40 | 0.84 | 0.25 | 0.48 | - |
+| − Transformer (LSTM history encoder) | *not run yet* | | | | | | |
+| − social (GAT + decoder social attention) | 0.76 | 1.57 | 0.40 | 0.85 | 0.25 | 0.49 | +0.01 |
+| − CVAE (one deterministic decode per goal) | *not run yet* | | | | | | |
+| − goal predictor (CVAE samples only) | *not run yet* | | | | | | |
+| − ranking network (one sample per goal) | *not run yet* | | | | | | |
+<!-- ablation:end -->
 
----
+The **map encoder cannot be ablated on ETH/UCY**, because the benchmark has no map data. On nuScenes, the map-expansion pack requires a nuScenes account, so no polylines are loaded there either. Any map result would therefore be meaningless, and none is claimed.
 
-## Project Structure
+### Where the model fails (ZARA1 test set, 2,356 pedestrians)
 
-```
-.
-├── config.yaml                 # All hyperparameters; only file you ever need to edit
-├── requirements.txt
-├── train.py                    # Training loop
-├── eval.py                     # Full metric evaluation
-├── inference.py                # Single-scene inference + optional visualization
-├── README.md
-│
-├── data/
-│   ├── __init__.py
-│   └── dataset.py              # DummyDataset, NuScenesDataset, DatasetFactory
-│
-├── models/
-│   ├── __init__.py
-│   ├── temporal_encoder.py     # Transformer over 8-step history → (N, D)
-│   ├── social_gat.py           # 2-layer GAT over agent graph → (N, D)
-│   ├── map_encoder.py          # MLP + cross-attention over polylines → (N, D)
-│   ├── goal_predictor.py       # Scored candidate goals → (N, K, 2)
-│   ├── cvae.py                 # Prior / posterior networks + KL loss
-│   ├── decoder.py              # GRU decoder with social attention → (N, 12, 2)
-│   └── trajectory_model.py     # Full pipeline + candidate ranking
-│
-├── utils/
-│   ├── __init__.py
-│   ├── preprocessing.py        # normalize_to_agent_frame / denormalize_from_agent_frame
-│   ├── losses.py               # minADE, minFDE, goal, KL, diversity, NLL losses
-│   ├── metrics.py              # ADE, FDE, MissRate, OracleFDE, Diversity
-│   └── visualization.py        # plot_scene — top-down matplotlib render
-│
-└── checkpoints/                # Created automatically; best_model.pt saved here
-```
+`scripts/analyze_failures.py` tags each test agent by motion pattern, then compares the model with constant velocity on the same agents. Tags can overlap.
 
----
+| Pattern | Agents | Ours minFDE@1 | Ours minFDE@6 | CV FDE | Our top-1 beats CV |
+|---|---|---|---|---|---|
+| all | 2,356 | 1.63 | 0.84 | 0.95 | 20% |
+| walking straight | 1,952 (83%) | 1.63 | 0.72 | 0.80 | 15% |
+| walking in a group | 1,234 (52%) | 1.65 | 0.75 | 0.81 | 14% |
+| dense crowd (≥5 people within 3 m) | 238 (10%) | 1.71 | 0.87 | 0.94 | 13% |
+| starting from standstill | 63 (3%) | 2.54 | 2.46 | 2.32 | 5% |
+| sharp turn (>45°) | 37 (2%) | 3.07 | 2.94 | 3.65 | **95%** |
+| stopping | 17 (1%) | 1.63 | 1.41 | 3.45 | **100%** |
 
-## Configuration (`config.yaml`)
-
-All hyperparameters live in one file. Key sections:
-
-```yaml
-dataset:
-  type: nuscenes       # uses 'nuscenes' by default; set to 'dummy' for no-data testing
-  data_root: ./        # path to your nuScenes v1.0-mini or full dataset
-  num_agents_max: 10
-  past_steps: 8
-  future_steps: 12
-  num_polylines: 6
-  polyline_points: 20
-
-model:
-  model_dim: 128       # D — shared embedding dimension
-  num_heads: 4
-  num_transformer_layers: 2
-  latent_dim: 32       # CVAE latent dimension
-  num_goals: 6         # K goals
-  num_candidates: 50   # total candidates before ranking
-  num_predictions: 6   # final top-K output
-
-training:
-  epochs: 200
-  batch_size: 32
-  learning_rate: 1e-4
-  grad_clip: 1.0
-  teacher_forcing_ratio: 0.5   # 0.0 forced at eval/inference
-  kl_anneal_epochs: 20
-  loss_weights:
-    min_ade: 1.0
-    min_fde: 1.0
-    goal: 0.5
-    kl: 0.1
-    diversity: 0.5
-    nll: 0.5           # optional; enable by setting > 0
-  checkpoint_path: checkpoints/best_model.pt
-
-logging:
-  use_wandb: false     # set true if wandb is installed
-  project_name: trajectory_prediction
-```
-
-No other file needs editing for standard runs.
-
----
-
-## Dataset Layer
-
-### DummyDataset
-
-Generates structurally valid random scenes entirely in memory — no files, no downloads.  
-Each scene contains 2–10 agents and returns:
-
-| Key | Shape | Description |
-|---|---|---|
-| `past` | `(N, 8, 4)` | History: (x, y, vx, vy) per timestep |
-| `future` | `(N, 12, 2)` | Ground truth future: (x, y) |
-| `mask` | `(N,)` | Bool — True for valid agents |
-| `map_polylines` | `(P, L, 2)` | P polylines of L points each |
-
-All coordinates are already in **agent-centric normalized frame**.
-
-### NuScenes Integration
-
-The codebase comes complete with a native `NuScenesDataset` implementation tightly integrated with the NuScenes devkit.
-
-1. Set `dataset.type: nuscenes` and `dataset.data_root: /path/to/nuscenes` in `config.yaml`.
-2. Ensure you have the `v1.0-mini` (or standard `v1.0`) NuScenes dataset ready at your data_root path.
-
-**No other file needs modification.**  
-`train.py`, `eval.py`, and `inference.py` all go through `DatasetFactory` and seamlessly switch between `nuscenes` and `dummy` dataset generation.
-
-### Scene JSON Format (for `inference.py --scene`)
-
-```json
-{
-  "past":          [[[x, y, vx, vy], ...], ...],
-  "future":        [[[x, y], ...], ...],
-  "mask":          [true, false, ...],
-  "map_polylines": [[[x, y], ...], ...]
-}
-```
-
-Shapes must match `(N, 8, 4)`, `(N, 12, 2)`, `(N,)`, `(P, L, 2)` respectively.
-
----
-
-## Model Architecture
-
-```
-past (N, 8, 4)
-    │
-    ├─► Temporal Encoder (Transformer, 2 layers, 4 heads)
-    │       └─► temporal_emb  (N, D=128)
-    │
-    ├─► Social Encoder (2-layer GAT, 4 heads)
-    │       └─► social_emb    (N, D)
-    │
-    └─► Map Encoder (MLP + cross-attention)
-            └─► map_emb       (N, D)
-                    │
-              Fusion MLP (LayerNorm + ReLU)
-                    │
-              context c       (N, 256)
-                    │
-          ┌─────────┴─────────┐
-          │                   │
-    Goal Predictor        CVAE Prior
-    top-K goals + probs   z ~ p(z|c)
-          │                   │
-          └─────────┬─────────┘
-                    │
-              GRU Decoder
-         (conditioned on c, goal, z)
-         (social attention at each step)
-                    │
-          50 candidate trajectories
-                    │
-            Ranking Network (MLP)
-                    │
-          top-K=6 predictions + scores
-                 (N, 6, 12, 2)
-```
-
-### Key design choices
-
-- **Temporal Encoder**: sinusoidal positional encoding + Transformer encoder; projects state dim 4 → model dim D.
-- **Social GAT**: fully connected agent graph; edge features are relative distance (1D) + relative velocity (2D).
-- **Map Encoder**: returns `zeros(N, D)` gracefully when map is absent — documented explicitly.
-- **CVAE**: KL weight anneals linearly from 0 → 1 over `kl_anneal_epochs` epochs.
-- **Decoder**: teacher forcing ratio configurable in config; forced to 0.0 at eval/inference; social attention added at every GRU step.
-- **Candidate generation**: outer loop over K goals × M latent samples → 50 candidates → scored → top-6 kept.
-
----
-
-## Losses
-
-| Loss | Description | Weight key |
-|---|---|---|
-| `min_ade_loss` | minADE@K — L2 over all 12 steps | `min_ade` |
-| `min_fde_loss` | minFDE@K — L2 at final step | `min_fde` |
-| `goal_loss` | L2 from best goal to true endpoint | `goal` |
-| `kl_loss` | KL divergence with linear annealing | `kl` |
-| `diversity_loss` | Negated mean pairwise L2 among K preds | `diversity` |
-| `nll_loss` | NLL of GT under predicted distribution (optional) | `nll` |
-
-All weights are read from `config.yaml → training.loss_weights`.  
-Each individual loss is logged separately every epoch.
-
----
-
-## Metrics
-
-| Metric | Description |
+| | |
 |---|---|
-| `ADE` | Average displacement error (all steps, best-of-K) |
-| `FDE` | Final displacement error (last step, best-of-K) |
-| `MissRate` | Fraction of agents where minFDE@K > 2.0 m |
-| `OracleFDE` | FDE of the closest prediction to GT (oracle) |
-| `Diversity` | Mean pairwise L2 distance among K predictions |
+| ![sharp turn](docs/failures/zara1_sharp_turn.png) | ![start](docs/failures/zara1_start.png) |
+| ![straight](docs/failures/zara1_straight.png) | ![group](docs/failures/zara1_group.png) |
+
+What the cases show:
+
+1. **Sharp turns (top left).** The pedestrian turns about 90°, but all six predictions continue within about ±15° of the current heading. The modes are too narrow to cover a turn. Even so, the model beats constant velocity on 95% of turning agents, because it has learned to curve and slow down where constant velocity runs straight on.
+2. **Starting from standstill (top right).** The pedestrian is almost still for 3.2 s, then walks 5.5 m. Every prediction stays put. Nothing in the motion history signals the decision to start walking. Without scene context (a door, a crossing, a destination), no motion-only model can anticipate it.
+3. **Speeding up (bottom left).** The same problem in milder form: a slow observed stretch followed by a fast walk. The top-ranked prediction stops early. The single most confident mode is biased towards slowing down, which is the main reason the model's top-1 loses to constant velocity on straight walking: its top-1 FDE is 1.63 m vs CV's 0.80 m.
+4. **Groups (bottom right).** Two pedestrians turn together. The model extrapolates each one's heading and does not use the companion's motion to anticipate the turn. The social layer would need to carry exactly this signal; the "− social" ablation measures how much it contributes.
+
+The same pattern appears on nuScenes. A cyclist riding faster than any cyclist in the training data is predicted to travel about 9 m when the true path covers about 33 m (see below). **Learned models do not extrapolate beyond the speeds they were trained on; constant velocity does by construction.**
+
+### nuScenes v1.0-mini (pipeline check, not a benchmark)
+
+2 Hz keyframes: 5 observed steps (2 s including the current frame) → 12 predicted steps (6 s), the nuScenes prediction-challenge horizon. Train on the official `mini_train` split (8 scenes), test on `mini_val` (2 scenes). Targets are pedestrians, plus bicycles annotated with a rider, that have a full 6 s future. Vehicles serve as social context only.
+
+| Method | Seeds | Type | Agents | minADE@1 | minFDE@1 | minADE@6 | minFDE@6 | MR@6 |
+|---|---|---|---|---|---|---|---|---|
+| Constant velocity | 3 | pedestrian | 594 | **0.67** | **1.47** | 0.52 | 1.06 | 0.15 |
+| LSTM enc-dec | 3 | pedestrian | 594 | 0.88 ± 0.09 | 1.85 ± 0.18 | **0.44 ± 0.01** | **0.83 ± 0.02** | **0.07 ± 0.02** |
+| Ours | 1 | pedestrian | 594 | 0.91 | 1.84 | 0.65 | 1.32 | 0.18 |
+| Constant velocity | 3 | cyclist | 6 | **0.93** | **1.82** | **0.93** | **1.82** | 0.50 |
+| LSTM enc-dec | 3 | cyclist | 6 | 12.80 ± 0.33 | 24.25 ± 0.42 | 12.71 ± 0.26 | 24.06 ± 0.32 | 1.00 |
+| Ours | 1 | cyclist | 6 | 14.32 | 26.72 | 13.65 | 25.45 | 1.00 |
+
+The full model has 1.4M parameters but gets only 168 training samples here, and it is the weakest model on pedestrians. The cyclist rows are a single cyclist seen in 6 consecutive keyframes. That cyclist rides at 5.1–5.5 m/s, faster than every cyclist among the 46 training examples (max 4.9 m/s), and has only two observed steps. With 8 training scenes, nuScenes-mini can show that the pipeline works but cannot rank models.
+
+### Inference time
+
+On CPU (i7-12700H, 4 threads, batch size 1), mean over 200 test scenes per split. Timings were taken while other training jobs shared the CPU, so treat them as upper bounds.
+
+| Method | ZARA1 (3.4 agents / scene) | UNIV (34.5 agents / scene) |
+|---|---|---|
+| Constant velocity | 0.1 ms | 0.4 ms |
+| LSTM enc-dec | 15.6 ms | 59.5 ms |
+| Ours (20 candidates, ranked) | 38.7 ms | 154.7 ms |
+
+At about 40 ms per scene for typical pedestrian scenes, the full model runs in real time at the 2.5 Hz annotation rate on a laptop CPU. Cost grows with the number of agents, because the social attention is quadratic in it.
 
 ---
 
-## Training Details
+## Data audit: what was wrong before, and what changed
 
-- **Optimizer**: Adam with cosine annealing LR scheduler and 5-epoch warmup.
-- **Gradient clipping**: max norm 1.0 (configurable).
-- **Checkpointing**: best validation loss saved to `config.training.checkpoint_path`.
-- **WandB**: enabled via `logging.use_wandb: true`; skipped gracefully if `wandb` is not installed.
-- **Stdout logging**: tabular per-epoch format, all losses and metrics printed.
+The first version of this project reported numbers on nuScenes-mini. An audit of the loader showed that those numbers could not be trusted:
 
----
+| Issue | Before | Now |
+|---|---|---|
+| Timing | README said 8 past / 12 future steps at 4 Hz (2 s / 3 s) | nuScenes keyframes are 2 Hz and nothing was interpolated, so the model actually saw 3.5 s and predicted 6 s. Now stated correctly: 2 s → 6 s |
+| Agent types | No category filter: 50% cars, 9% barriers/cones, 27% pedestrians, 3% bicycles. 55% of agents moved less than 0.5 m | Only pedestrians and ridden bicycles are scored; vehicles are social context only |
+| Validation split | The last 10 samples of one scene that also appeared in training (neighbouring frames leak) | The official scene-level `mini_train` / `mini_val` split |
+| Map | Map expansion absent → every polyline was zeros, so the map encoder only ever saw zeros | Stated explicitly. No map result is claimed |
+| Frame | Centred on "agent 0", which was just the first annotation in the file | Centred on the ego vehicle pose |
+| History padding | Missing history was filled by repeating the oldest box, with no mask | Padded steps are masked in the encoder |
 
-## Coordinate Frame Convention
+Model and training bugs found while building the benchmark (each was verified on validation data before the final runs):
 
-All coordinates passed to any model component are in the **ego-agent's local frame**:
-
-- Origin: agent's last observed position.
-- X-axis: agent's last observed heading direction.
-
-`utils/preprocessing.py` provides:
-- `normalize_to_agent_frame(past, future, map_polylines)` — world → agent frame.
-- `denormalize_from_agent_frame(predictions, origin, heading)` — agent frame → world.
-
-`DummyDataset` returns data already normalized.  
-`NuScenesDataset` stubs call `normalize_to_agent_frame` explicitly.
+- **Decoder origin.** The decoder started every agent at the scene origin, so every agent except agent 0 had to "jump" to its own position on the first step. Each agent is now decoded relative to its own last position.
+- **Ranking network.** The ranking loss stayed at exactly ln(20) for a whole training run: the network gave all candidates the same score, so the "top-6" were effectively random. The trajectory now has its own encoder, candidates are detached from the ranking loss, and the targets are soft (`softmax(−ADE/0.2 m)`).
+- **Posterior candidates in the winner-takes-all pool.** Ground-truth-guided CVAE candidates were in the best-of-K pool, so they almost always won and the prior samples used at test time got little gradient. Now there is a separate reconstruction loss.
+- **Goal candidates.** These were Gaussian noise (σ = 3 m) around the agent plus positions of padding agents. They are now a speed × heading grid around the constant-velocity endpoint, plus rings for slow agents, plus lane endpoints, with TNT-style offset regression.
+- **Speed.** Attention was computed through dense `(B·C, N, N, 128)` tensors, and constant decoder inputs were recomputed at every step. Together these made training about 35× slower. Batches now also group scenes of similar size, because padding to the largest scene in a batch wasted most of the O(N²) social attention.
 
 ---
 
-## Requirements
-
-```
-torch>=2.0.0
-numpy>=1.24.0
-matplotlib>=3.7.0
-pyyaml>=6.0
-wandb>=0.15.0   # optional
-```
-
-Install with:
+## Reproduce
 
 ```bash
+python -m venv .venv && .venv/Scripts/activate      # or source .venv/bin/activate
 pip install -r requirements.txt
+
+python scripts/download_eth_ucy.py                  # ~10 MB, Social-GAN split files
+python -m pytest tests -q                           # 16 fast checks, no GPU needed
+
+# Every number above (resumable; finished runs are skipped)
+python scripts/run_benchmark.py                     # ETH/UCY: 8 variants x 5 scenes x 3 seeds
+python scripts/run_benchmark.py --dataset nuscenes_mini --variants cv lstm ours
+python scripts/run_benchmark.py --aggregate-only    # rebuild results/*.md from finished runs
+python scripts/ablation_table.py                    # refresh the ablation table in this README
+python scripts/export_checkpoints.py                # copy slim seed-0 checkpoints into release/
 ```
+
+Single runs:
+
+```bash
+python train.py --config configs/eth_ucy.yaml --set dataset.test_scene=hotel --seed 1
+python train.py --config configs/eth_ucy.yaml --set model.use_social=false   # an ablation
+python eval.py  --checkpoint runs/eth_ucy/hotel/ours/seed1/best.pt --out results/hotel.json
+python eval.py  --config configs/eth_ucy.yaml --set model.type=cv dataset.test_scene=eth
+
+python scripts/analyze_failures.py --checkpoint runs/eth_ucy/zara1/ours/seed0/best.pt
+python scripts/make_gif.py --checkpoint runs/eth_ucy/zara1/ours/seed0/best.pt --out docs/media/zara1.gif
+python inference.py --checkpoint runs/eth_ucy/zara1/ours/seed0/best.pt --index 10 --save-plot outputs/scene.png
+```
+
+Any config key can be overridden with `--set key.path=value`; no edited copies of the YAML are needed. Compute: everything here was run on a laptop CPU. One full-model run takes about 15 epochs of about 1 minute each on 6 threads.
 
 ---
 
-## Expected Training Output
+## Model
 
 ```
-[train] Epoch  1/50 | loss=4.3821 | ade=3.1045 | fde=5.2231 | miss=0.8412
-         losses → min_ade=1.2103  min_fde=2.0541  goal=0.4311  kl=0.0000  div=-0.3134
-[train] Epoch  2/50 | loss=4.1033 | ade=2.9832 | fde=5.0112 | miss=0.8201
-...
-[val]   Epoch  2/50 | ADE=2.9104  FDE=4.9830  MissRate=0.8100  OracleFDE=3.1205  Diversity=1.2304
-...
-[train] Best model saved → checkpoints/best_model.pt
+past (N, T, 4) ─ relative to each agent's last position
+   ├─► Temporal encoder   Transformer (2 layers, masked padding) ─┐
+   ├─► Social encoder     2-layer GAT, edges = distance, rel. velocity ├─► fusion MLP ─► context c (N, 256)
+   └─► Map encoder        per-agent polyline MLP + cross-attention ─┘
+c ─► Goal predictor   kinematic + lane candidates, scored, offset-refined ─► top-6 goals
+c ─► CVAE prior       z ~ p(z|c); the first sample per goal uses the prior mean
+(c, goal, z) ─► GRU decoder with per-step social attention ─► 20 candidates (12 steps each)
+candidates ─► ranking network (trajectory encoder + context) ─► top-K, sorted by confidence
 ```
+
+Training losses (weights in `configs/*.yaml → training.loss_weights`):
+
+| Loss | Purpose |
+|---|---|
+| minADE / minFDE over the 20 prior candidates | winner-takes-all multi-modality |
+| reconstruction | ADE of a guided candidate (posterior z, ground-truth goal, teacher forcing); trains the CVAE posterior and goal-following |
+| goal | cross-entropy toward the candidate nearest the true endpoint, plus smooth-L1 offset regression |
+| KL | KL(q(z \| c, future) ‖ p(z \| c)), annealed |
+| rank | soft-target cross-entropy that teaches the ranker which candidates are closest |
+| diversity, NLL | optional, off by default |
+
+The checkpoint and early stopping both use validation minADE@6 + minFDE@6, so every ablation is selected by the same criterion.
 
 ---
 
+## Project structure
+
+```
+configs/            eth_ucy.yaml (main benchmark), nuscenes_mini.yaml
+data/dataset.py     ETHUCYDataset, NuScenesDataset (JSON tables, devkit optional), DummyDataset,
+                    collate with history / future / target masks, size-grouped batch sampler
+models/             temporal_encoder, social_gat, map_encoder, goal_predictor, cvae, decoder,
+                    trajectory (full model + ablation switches), baselines (CV, LSTM)
+utils/              losses, metrics (per-agent @K errors), preprocessing, config overrides
+train.py eval.py inference.py
+scripts/            download_eth_ucy, run_benchmark, analyze_failures, make_gif, ablation_table,
+                    export_checkpoints
+tests/              pipeline invariants (every variant trains; CV is exact on linear motion; padding
+                    agents do not change real predictions; @1 uses the top-ranked mode; ...)
+results/            aggregated tables (*.md) and raw summaries (*.json)
+release/            trained checkpoints, written locally by export_checkpoints.py (not in git)
+docs/               failure-case plots and the prediction GIF used in this README
+demo.py demo_pedestrian.py   interactive HTML pages for nuScenes-mini predictions
+```
+
+## References
+
+- Gupta et al., *Social GAN: Socially Acceptable Trajectories with Generative Adversarial Networks*, CVPR 2018. Source of the ETH/UCY split files and the best-of-20 protocol.
+- Schöller et al., *What the Constant Velocity Model Can Teach Us About Pedestrian Motion Prediction*, RA-L 2020.
+- Zhao et al., *TNT: Target-driveN Trajectory Prediction*, CoRL 2020. Goal candidates plus offset regression.
+- Caesar et al., *nuScenes: A multimodal dataset for autonomous driving*, CVPR 2020.
