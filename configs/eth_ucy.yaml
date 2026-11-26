@@ -1,0 +1,82 @@
+# ETH/UCY pedestrian benchmark, leave-one-scene-out.
+# 2.5 Hz annotations: 8 observed steps (3.2 s) -> 12 predicted steps (4.8 s).
+dataset:
+  type: eth_ucy
+  data_root: data/eth_ucy        # python scripts/download_eth_ucy.py
+  test_scene: zara1              # eth | hotel | univ | zara1 | zara2
+  dt: 0.4
+  past_steps: 8
+  future_steps: 12
+  num_agents_max: null           # null = keep every pedestrian in the window
+  augment_rotation: true         # random rotation of training windows
+  train_window_stride: 2         # consecutive windows overlap 19/20 frames; test uses all
+  polyline_points: 20            # ETH/UCY has no map; polylines are empty
+
+model:
+  type: trajectory               # trajectory | lstm | cv
+  model_dim: 128
+  num_heads: 4
+  num_transformer_layers: 2
+  latent_dim: 32
+  num_goals: 6
+  num_candidates: 20             # >= 20 so best-of-20 can be reported
+  num_predictions: 6
+  state_dim: 4                   # (x, y, vx, vy)
+  goal_embed_dim: 64
+  decoder_hidden_dim: 128
+  gat_heads: 4
+  gat_layers: 2
+  edge_dim: 3
+  # --- ablation switches ---
+  temporal_encoder: transformer  # transformer | lstm
+  use_social: true
+  use_map: true                  # no effect on ETH/UCY (no map data)
+  use_cvae: true
+  use_goals: true
+  use_ranking: true
+  # --- LSTM baseline ---
+  lstm_hidden: 128
+  lstm_modes: 20
+
+baseline:
+  heading_noise_deg: 25.0        # constant-velocity sampling variant
+
+training:
+  seed: 0
+  epochs: 15
+  warmup_epochs: 2
+  batch_size: 32
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  grad_clip: 1.0
+  num_workers: 0
+  max_agents_per_batch: 256       # batches group scenes of similar size
+  teacher_forcing_ratio: 0.5
+  teacher_forcing_min: 0.0
+  teacher_forcing_decay_epochs: 10
+  kl_anneal_epochs: 8
+  early_stopping_patience: 6
+  max_batches_per_epoch: null
+  checkpoint_path: runs/eth_ucy/zara1/ours/seed0/best.pt
+  diversity_clamp: 3.0
+  rank_temperature: 0.2          # soft ranking targets softmax(-ADE / T), metres
+  loss_weights:
+    min_ade: 1.0
+    min_fde: 1.0
+    recon: 1.0
+    goal: 0.5
+    kl: 0.1
+    diversity: 0.0
+    rank: 1.0
+    nll: 0.0
+
+evaluation:
+  ks: [1, 6, 20]
+  miss_threshold: 2.0
+  seed: 0
+  timing_scenes: 200
+
+logging:
+  use_wandb: false
+  project_name: trajectory
+  log_every: 1

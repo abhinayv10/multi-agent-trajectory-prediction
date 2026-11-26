@@ -50,20 +50,23 @@ def normalize_to_agent_frame(
     future: np.ndarray,
     map_polylines: np.ndarray,
     ego_idx: int = 0,
+    origin: np.ndarray = None,
+    angle: float = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """
-    Transforms all coordinates into the ego agent's local frame at its
-    last observed timestep.
+    Transforms all coordinates into a local scene frame.
 
-    Convention:
+    Default convention (when origin / angle are not given):
         - Origin   : ego agent's position at t=-1 (last observed step)
         - Heading  : ego agent's velocity direction at t=-1 aligns with +x
 
     Args:
         past          : (N, T_past, 4)   — world frame (x, y, vx, vy)
         future        : (N, T_future, 2) — world frame (x, y)
-        map_polylines : (P, L, 2)        — world frame (x, y)
+        map_polylines : (P, L, 2)        — world frame (x, y); P may be 0
         ego_idx       : index of the ego agent (default 0)
+        origin        : optional (2,) world-frame origin override
+        angle         : optional world heading (radians) mapped onto +x
 
     Returns:
         past_norm   : (N, T_past, 4)   in agent-centric frame
@@ -77,9 +80,13 @@ def normalize_to_agent_frame(
     map_polylines = np.array(map_polylines, dtype=np.float32)  # (P, L, 2)
 
     # --- determine origin and heading ---
-    origin = past[ego_idx, -1, :2].copy()           # (2,)  last position of ego
-    vx, vy = past[ego_idx, -1, 2], past[ego_idx, -1, 3]
-    angle = float(np.arctan2(vy, vx)) if (abs(vx) + abs(vy)) > 1e-6 else 0.0
+    if origin is None:
+        origin = past[ego_idx, -1, :2].copy()       # (2,)  last position of ego
+    origin = np.asarray(origin, dtype=np.float32).copy()
+    if angle is None:
+        vx, vy = past[ego_idx, -1, 2], past[ego_idx, -1, 3]
+        angle = float(np.arctan2(vy, vx)) if (abs(vx) + abs(vy)) > 1e-6 else 0.0
+    angle = float(angle)
 
     R = _get_rotation_matrix(angle)                 # (2, 2)
 
