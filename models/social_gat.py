@@ -88,9 +88,8 @@ class GATLayer(nn.Module):
         V = self.W_v(x).reshape(B, N, self.num_heads, self.head_dim)  # (B, N, H, Dh)
 
         # Compute raw attention scores: Q_i · K_j for all i, j
-        Q_exp = Q.unsqueeze(2)   # (B, N, 1, H, Dh)
-        K_exp = K.unsqueeze(1)   # (B, 1, N, H, Dh)
-        scores = (Q_exp * K_exp).sum(-1) * self.scale           # (B, N, N, H)
+        # einsum avoids materialising a (B, N, N, H, Dh) broadcast product.
+        scores = torch.einsum("bnhd,bmhd->bnmh", Q, K) * self.scale  # (B, N, N, H)
 
         # Add edge feature contribution (one scalar per head per edge)
         edge_bias = self.edge_proj(edge_features)               # (B, N, N, H)
@@ -107,9 +106,7 @@ class GATLayer(nn.Module):
         attn = torch.nan_to_num(attn, nan=0.0)
 
         # Aggregate values
-        V_exp  = V.unsqueeze(1)                                 # (B, 1, N, H, Dh)
-        attn_exp = attn.unsqueeze(-1)                           # (B, N, N, H, 1)
-        agg = (attn_exp * V_exp).sum(dim=2)                     # (B, N, H, Dh)
+        agg = torch.einsum("bnmh,bmhd->bnhd", attn, V)          # (B, N, H, Dh)
         agg = agg.reshape(B, N, self.out_dim)                   # (B, N, out_dim)
 
         # Output projection + residual + norm

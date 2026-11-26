@@ -2,181 +2,145 @@
 models/goal_predictor.py
 
 Purpose:
-    Predicts probable destination (goal) points for each agent.
-    Samples candidate goals from neighbor endpoints and map polylines,
-    scores them using a neural network, and selects top-K.
+    Predicts probable destination (goal) points for each agent, TNT-style:
+    a fixed set of kinematic + map candidates is scored by a network, each
+    candidate gets a learned offset, and the top-K refined goals are kept.
+
+    All goal coordinates are relative to the agent's last observed position.
 
 Inputs:
     context       : (B, N, 256)  — fused context vector
-    past          : (B, N, T, 4) — for sampling neighbor-based goals
-    map_polylines : (B, P, L, 2) — for sampling polyline endpoints
+    last_vel      : (B, N, 2)    — last observed velocity (scene frame)
+    map_polylines : (B, P, L, 2) — lane polylines (scene frame), may have P = 0
+    agent_pos     : (B, N, 2)    — last observed positions (scene frame)
+    polyline_mask : (B, P) bool
 
-Outputs:
-    goal_coords    : (B, N, K, 2) — top-K goal coordinates
-    goal_log_probs : (B, N, K)    — log-probabilities of top-K goals
+Outputs (dict):
+    goal_coords     : (B, N, K, 2) — top-K refined goals (relative)
+    goal_log_probs  : (B, N, K)    — log-probabilities of the top-K goals
+    candidates      : (B, N, C, 2) — raw candidates (relative)
+    refined         : (B, N, C, 2) — candidates + learned offsets
+    logits          : (B, N, C)    — candidate scores
 
 Public interface:
     GoalPredictor(config, device) -> Module
-    forward(context, past, map_polylines) -> (goal_coords, goal_log_probs)
+    forward(context, last_vel, map_polylines, agent_pos, polyline_mask, k) -> dict
 """
+
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+
+# Kinematic candidate grid around the constant-velocity endpoint.
+SPEED_SCALES = (0.5, 0.8, 1.0, 1.2, 1.5)
+HEADING_OFFSETS_DEG = (-90, -45, -20, 0, 20, 45, 90)
+# Rings (metres) for slow agents whose heading is unreliable.
+RING_RADII = (1.0, 3.0, 6.0)
+RING_DIRECTIONS = 8
+COORD_SCALE = 10.0   # network inputs are divided by this (metres -> ~unit range)
 
 
 class GoalPredictor(nn.Module):
     """
-    Intent-first goal prediction module.
-
-    Candidate generation strategy:
-        - Final observed positions of all neighbor agents + Gaussian noise
-        - Endpoints of map polylines (first and last point of each lane)
-        - Random Gaussian samples around the ego agent's last position
-
-    Scoring:
-        - MLP over concatenation of (goal_coord, context_vector)
-
     Args:
-        config : full config dict
+        config : full config dict (reads model.num_goals, dataset.dt,
+                 dataset.future_steps)
         device : torch.device
     """
 
     def __init__(self, config: dict, device: torch.device):
         super().__init__()
         self.device = device
-
         m = config["model"]
-        self.num_goals      = m["num_goals"]        # K = 6
-        context_dim         = 256                   # from fusion MLP output
-        goal_dim            = 2                     # (x, y)
+        self.num_goals = m["num_goals"]
+        self.horizon = config["dataset"]["future_steps"] * config["dataset"].get("dt", 0.4)
+        context_dim = 256
 
-        # MLP scorer: takes [goal_coord || context] → scalar score
         self.scorer = nn.Sequential(
-            nn.Linear(goal_dim + context_dim, 256),
+            nn.Linear(2 + context_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
         )
-
+        self.offset_head = nn.Sequential(
+            nn.Linear(2 + context_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 2),
+        )
         self.to(device)
 
-    def _sample_candidates(
-        self,
-        past: torch.Tensor,           # (B, N, T, 4)
-        map_polylines: torch.Tensor,  # (B, P, L, 2)
-        num_candidates: int = 50,
-    ) -> torch.Tensor:                # returns (B, N, C, 2)
-        """
-        Sample C goal candidates per agent.
+    def _candidates(self, last_vel, map_polylines, agent_pos, polyline_mask):
+        """Deterministic candidate set, relative to each agent: (B, N, C, 2)."""
+        B, N, _ = last_vel.shape
+        dev, dt = last_vel.device, last_vel.dtype
+        speed = last_vel.norm(dim=-1, keepdim=True)                  # (B, N, 1)
+        heading = torch.atan2(last_vel[..., 1], last_vel[..., 0]).unsqueeze(-1)
 
-        Sources (combined up to num_candidates):
-            1. Neighbor last positions + Gaussian noise (std=2.0m)
-            2. Map polyline endpoints (first and last point)
-            3. Random Gaussian around ego's last position
-        """
-        B, N, T, _ = past.shape                                 # unpack
-        device = past.device
+        # Stop + speed x heading grid around the CV endpoint.
+        scales = torch.tensor(SPEED_SCALES, device=dev, dtype=dt)
+        offs = torch.tensor(HEADING_OFFSETS_DEG, device=dev, dtype=dt) * math.pi / 180
+        s_grid, o_grid = torch.meshgrid(scales, offs, indexing="ij")
+        s_grid, o_grid = s_grid.reshape(-1), o_grid.reshape(-1)       # (S*H,)
+        dist = speed * self.horizon * s_grid                          # (B, N, S*H)
+        ang = heading + o_grid
+        kin = torch.stack([dist * torch.cos(ang), dist * torch.sin(ang)], -1)
+        stop = last_vel.new_zeros(B, N, 1, 2)
 
-        all_candidates = []
+        # Rings, aligned with the heading so they rotate with the scene.
+        radii = torch.tensor(RING_RADII, device=dev, dtype=dt)
+        dirs = torch.arange(RING_DIRECTIONS, device=dev, dtype=dt) * (2 * math.pi / RING_DIRECTIONS)
+        r_grid, d_grid = torch.meshgrid(radii, dirs, indexing="ij")
+        r_grid, d_grid = r_grid.reshape(-1), d_grid.reshape(-1)
+        ring_ang = heading + d_grid
+        ring = torch.stack([r_grid * torch.cos(ring_ang), r_grid * torch.sin(ring_ang)], -1)
 
-        # Source 1: neighbor endpoints with noise
-        last_pos = past[:, :, -1, :2]                          # (B, N, 2)
-        for _ in range(10):
-            noise = torch.randn_like(last_pos) * 2.0            # (B, N, 2)
-            # For each agent, use a different neighbor's position
-            perm = torch.randperm(N, device=device)
-            neighbor_pos = last_pos[:, perm, :]                 # (B, N, 2)
-            all_candidates.append(neighbor_pos + noise)         # (B, N, 2)
+        parts = [stop, kin, ring.expand(B, N, -1, 2)]
 
-        # Source 2: map polyline endpoints
+        # Lane endpoints (start and end of each polyline), relative to the agent.
         if map_polylines is not None and map_polylines.shape[1] > 0:
-            P = map_polylines.shape[1]
-            poly_starts = map_polylines[:, :, 0, :]             # (B, P, 2)
-            poly_ends   = map_polylines[:, :, -1, :]            # (B, P, 2)
-
-            # Expand polyline endpoints to per-agent candidates
-            # Each agent gets all polyline endpoints (use subset if too many)
-            max_poly = min(P, 10)
-            for p_idx in range(max_poly):
-                # Expand (B, 2) → (B, N, 2)
-                ep_start = poly_starts[:, p_idx, :].unsqueeze(1).expand(B, N, 2)
-                ep_end   = poly_ends[:, p_idx, :].unsqueeze(1).expand(B, N, 2)
-                all_candidates.append(ep_start)
-                all_candidates.append(ep_end)
-
-        # Source 3: random Gaussian around each agent's last position
-        ego_last = past[:, :, -1, :2]                          # (B, N, 2)
-        for _ in range(20):
-            rand = ego_last + torch.randn_like(ego_last) * 3.0  # (B, N, 2)
-            all_candidates.append(rand)
-
-        # Stack all candidates: list of (B, N, 2) → (B, N, C_total, 2)
-        candidates = torch.stack(all_candidates, dim=2)         # (B, N, C_total, 2)
-
-        # Subsample to num_candidates
-        C_total = candidates.shape[2]
-        if C_total > num_candidates:
-            idx = torch.randperm(C_total, device=device)[:num_candidates]
-            candidates = candidates[:, :, idx, :]               # (B, N, C, 2)
-        elif C_total < num_candidates:
-            # Pad by repeating with noise
-            deficit = num_candidates - C_total
-            pad = candidates[:, :, :deficit, :] + torch.randn(
-                B, N, deficit, 2, device=device
-            ) * 1.0
-            candidates = torch.cat([candidates, pad], dim=2)    # (B, N, C, 2)
-
-        return candidates                                        # (B, N, C, 2)
+            ends = torch.cat([map_polylines[:, :, 0], map_polylines[:, :, -1]], 1)  # (B, 2P, 2)
+            rel = ends.unsqueeze(1) - agent_pos.unsqueeze(2)                         # (B, N, 2P, 2)
+            if polyline_mask is not None:
+                valid = torch.cat([polyline_mask, polyline_mask], 1)                 # (B, 2P)
+                # Padded polylines collapse to the "stop" candidate.
+                rel = rel * valid[:, None, :, None].to(rel.dtype)
+            parts.append(rel)
+        return torch.cat(parts, dim=2)
 
     def forward(
         self,
-        context: torch.Tensor,          # (B, N, 256)
-        past: torch.Tensor,             # (B, N, T, 4)
-        map_polylines: torch.Tensor,    # (B, P, L, 2) or None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            context       : (B, N, 256) — fused context vector per agent
-            past          : (B, N, T, 4) — agent histories for candidate sampling
-            map_polylines : (B, P, L, 2) — map data for goal sampling
+        context: torch.Tensor,              # (B, N, 256)
+        last_vel: torch.Tensor,             # (B, N, 2)
+        map_polylines: torch.Tensor = None, # (B, P, L, 2)
+        agent_pos: torch.Tensor = None,     # (B, N, 2)
+        polyline_mask: torch.Tensor = None, # (B, P)
+        k: int = None,
+    ) -> dict:
+        B, N, C_dim = context.shape
+        K = k or self.num_goals
+        if agent_pos is None:
+            agent_pos = context.new_zeros(B, N, 2)
+        cand = self._candidates(last_vel, map_polylines, agent_pos, polyline_mask)  # (B, N, C, 2)
+        C = cand.shape[2]
+        if K > C:
+            raise ValueError(f"GoalPredictor: asked for {K} goals but only {C} candidates exist")
 
-        Returns:
-            goal_coords    : (B, N, K, 2) — top-K goal coordinates
-            goal_log_probs : (B, N, K)    — log-probabilities (sum to ~1 over K)
-        """
-        B, N, C_dim = context.shape                             # unpack
+        ctx_exp = context.unsqueeze(2).expand(B, N, C, C_dim)
+        inp = torch.cat([cand / COORD_SCALE, ctx_exp], dim=-1)       # (B, N, C, 2+256)
+        logits = self.scorer(inp).squeeze(-1)                         # (B, N, C)
+        refined = cand + self.offset_head(inp) * COORD_SCALE * 0.1    # offsets ~ metres
 
-        # 1. Sample candidate goals
-        candidates = self._sample_candidates(past, map_polylines, num_candidates=50)
-        # candidates: (B, N, C, 2)
-        C = candidates.shape[2]
-
-        # 2. Score each candidate
-        # Expand context to match candidates: (B, N, 256) → (B, N, C, 256)
-        ctx_exp = context.unsqueeze(2).expand(B, N, C, C_dim)  # (B, N, C, 256)
-
-        # Concatenate goal and context
-        scorer_input = torch.cat([candidates, ctx_exp], dim=-1)  # (B, N, C, 258)
-        flat_input = scorer_input.reshape(B * N * C, -1)         # (B*N*C, 258)
-
-        scores = self.scorer(flat_input)                         # (B*N*C, 1)
-        scores = scores.reshape(B, N, C)                        # (B, N, C)
-
-        # 3. Softmax to get probability distribution over C candidates
-        log_probs_all = F.log_softmax(scores, dim=-1)           # (B, N, C)
-
-        # 4. Select top-K candidates by score
-        K = self.num_goals
-        _, top_idx = scores.topk(K, dim=-1)                    # (B, N, K)
-
-        # Gather top-K goal coordinates
-        top_idx_exp = top_idx.unsqueeze(-1).expand(B, N, K, 2)  # (B, N, K, 2)
-        goal_coords = candidates.gather(2, top_idx_exp)          # (B, N, K, 2)
-
-        # Gather top-K log-probs
-        goal_log_probs = log_probs_all.gather(2, top_idx)        # (B, N, K)
-
-        return goal_coords, goal_log_probs
+        log_probs_all = F.log_softmax(logits, dim=-1)
+        _, top_idx = logits.topk(K, dim=-1)                           # sorted, best first
+        goal_coords = refined.gather(2, top_idx.unsqueeze(-1).expand(B, N, K, 2))
+        goal_log_probs = log_probs_all.gather(2, top_idx)
+        return {
+            "goal_coords": goal_coords,
+            "goal_log_probs": goal_log_probs,
+            "candidates": cand,
+            "refined": refined,
+            "logits": logits,
+        }

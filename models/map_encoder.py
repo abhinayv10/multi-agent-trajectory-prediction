@@ -80,57 +80,63 @@ class MapEncoder(nn.Module):
 
     def forward(
         self,
-        agent_emb: torch.Tensor,            # (B, N, model_dim)
-        map_polylines: torch.Tensor,        # (B, P, L, 2)
-    ) -> torch.Tensor:                      # returns (B, N, model_dim)
+        agent_emb: torch.Tensor,                    # (B, N, model_dim)
+        map_polylines: torch.Tensor,                # (B, P, L, 2)
+        agent_pos: torch.Tensor = None,             # (B, N, 2) last observed positions
+        polyline_mask: torch.Tensor = None,         # (B, P) bool, True = real polyline
+    ) -> torch.Tensor:                              # returns (B, N, model_dim)
         """
         Args:
             agent_emb     : (B, N, D) — agent embeddings used as cross-attn queries
-            map_polylines : (B, P, L, 2) — lane polylines in agent-centric frame
+            map_polylines : (B, P, L, 2) — lane polylines in the scene frame
+            agent_pos     : (B, N, 2) — if given, every agent encodes the
+                            polylines relative to its own position, so the
+                            attention knows where the lanes are *for that agent*
+            polyline_mask : (B, P) — padded polylines are ignored
 
         Returns:
-            map_emb : (B, N, D) — per-agent map context vector.
-                      Zero vector if map data is empty or unavailable.
+            map_emb : (B, N, D) — per-agent map context vector. Zero for scenes
+                      without any polyline (and for the whole batch when the
+                      map is unavailable).
         """
-        B, N, D = agent_emb.shape                               # unpack
-
-        # --- handle missing or empty map data ---
+        B, N, D = agent_emb.shape
+        zeros = agent_emb.new_zeros(B, N, self.model_dim)
         if map_polylines is None:
-            return torch.zeros(B, N, self.model_dim, device=self.device)
-
-        map_polylines = map_polylines.to(self.device)
-
-        P, L = map_polylines.shape[1], map_polylines.shape[2]  # num polylines, num points
-
+            return zeros
+        map_polylines = map_polylines.to(agent_emb.device)
+        P, L = map_polylines.shape[1], map_polylines.shape[2]
         if P == 0 or L == 0:
-            # No polylines: return zero map embedding
-            return torch.zeros(B, N, self.model_dim, device=self.device)
+            return zeros
+        if polyline_mask is None:
+            # Legacy inputs: an all-zero polyline is padding.
+            polyline_mask = map_polylines.abs().sum(dim=(-1, -2)) > 1e-8   # (B, P)
+        polyline_mask = polyline_mask.to(agent_emb.device)
+        has_map = polyline_mask.any(dim=1)                                  # (B,)
+        if not bool(has_map.any()):
+            return zeros
 
-        # Check if all polylines are zero (dummy padding)
-        if map_polylines.abs().sum() < 1e-8:
-            return torch.zeros(B, N, self.model_dim, device=self.device)
+        # 1-3. Point MLP -> max-pool -> projection, per agent-relative polyline.
+        if agent_pos is not None:
+            rel = map_polylines.unsqueeze(1) - agent_pos[:, :, None, None, :]  # (B, N, P, L, 2)
+        else:
+            rel = map_polylines.unsqueeze(1).expand(B, N, P, L, 2)
+        poly_feats = self.point_mlp(rel).max(dim=3).values                  # (B, N, P, D)
+        poly_feats = self.polyline_proj(poly_feats).reshape(B * N, P, D)    # (B*N, P, D)
 
-        # 1. Apply pointwise MLP to each (x, y) point
-        flat_points = map_polylines.reshape(B * P, L, 2)       # (B*P, L, 2)
-        point_feats = self.point_mlp(flat_points)               # (B*P, L, D)
-
-        # 2. Max-pool over points within each polyline
-        poly_feats = point_feats.max(dim=1).values              # (B*P, D)
-        poly_feats = poly_feats.reshape(B, P, D)                # (B, P, D)
-
-        # 3. Polyline projection
-        poly_feats = self.polyline_proj(poly_feats)             # (B, P, D)
-
-        # 4. Cross-attention: each agent attends over all polylines.
-        # batch_first MultiheadAttention accepts query (B, N, D) against
-        # key/value (B, P, D) directly — no need to replicate the polyline
-        # features N times into a (B*N, P, D) tensor.
+        # 4. Cross-attention: each agent attends over its own polyline set.
+        # Scenes without polylines get a dummy all-valid mask (no NaN rows);
+        # their output is zeroed below.
+        key_pad = ~polyline_mask
+        key_pad = key_pad & has_map.unsqueeze(1)
+        key_pad = key_pad.unsqueeze(1).expand(B, N, P).reshape(B * N, P)
         attn_out, _ = self.cross_attn(
-            query=agent_emb,  # (B, N, D)
-            key=poly_feats,   # (B, P, D)
-            value=poly_feats, # (B, P, D)
-        )                                                        # (B, N, D)
+            query=agent_emb.reshape(B * N, 1, D),
+            key=poly_feats,
+            value=poly_feats,
+            key_padding_mask=key_pad,
+        )                                                                   # (B*N, 1, D)
+        attn_out = attn_out.reshape(B, N, D)
 
-        # 5. Residual + norm
-        map_emb = self.norm(attn_out + agent_emb)               # (B, N, D)
-        return map_emb
+        # 5. Residual + norm; scenes without a map contribute nothing.
+        map_emb = self.norm(attn_out + agent_emb)
+        return map_emb * has_map.view(B, 1, 1).to(map_emb.dtype)

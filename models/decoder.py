@@ -62,9 +62,7 @@ class SocialAttentionStep(nn.Module):
         V = keys                            # (B, N, C)
 
         # Attention scores: Q_i · K_j
-        Q_ = Q.unsqueeze(2)                 # (B, N, 1, C)
-        K_ = K.unsqueeze(1)                 # (B, 1, N, C)
-        scores = (Q_ * K_).sum(-1) * self.scale   # (B, N, N)
+        scores = torch.bmm(Q, K.transpose(1, 2)) * self.scale   # (B, N, N)
 
         # Mask: each agent should not strongly attend to invalid agents
         if mask is not None:
@@ -75,9 +73,35 @@ class SocialAttentionStep(nn.Module):
         attn = torch.nan_to_num(attn, nan=0.0)
 
         # Weighted sum of V
-        out = (attn.unsqueeze(-1) * V.unsqueeze(1)).sum(dim=2)   # (B, N, C)
+        out = torch.bmm(attn, V)                                  # (B, N, C)
         out = self.output_proj(out)                               # (B, N, C)
         return out
+
+
+class StaticInputGRUCell(nn.Module):
+    """GRU cell whose input splits into a per-step part and a part that is
+    constant over the sequence. Call project_const() once, then step with the
+    per-step input. Equivalent to nn.GRUCell on the concatenated input."""
+
+    def __init__(self, var_dim: int, const_dim: int, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.w_var = nn.Linear(var_dim, 3 * hidden_dim, bias=False)
+        self.w_const = nn.Linear(const_dim, 3 * hidden_dim)
+        self.w_hh = nn.Linear(hidden_dim, 3 * hidden_dim)
+
+    def project_const(self, const_input: torch.Tensor) -> torch.Tensor:
+        return self.w_const(const_input)
+
+    def forward(self, var_input, const_gates, hidden):
+        gi = self.w_var(var_input) + const_gates
+        gh = self.w_hh(hidden)
+        i_r, i_z, i_n = gi.chunk(3, dim=-1)
+        h_r, h_z, h_n = gh.chunk(3, dim=-1)
+        r = torch.sigmoid(i_r + h_r)
+        z = torch.sigmoid(i_z + h_z)
+        n = torch.tanh(i_n + r * h_n)
+        return (1.0 - z) * n + z * hidden
 
 
 class Decoder(nn.Module):
@@ -104,6 +128,8 @@ class Decoder(nn.Module):
         self.hidden_dim    = m["decoder_hidden_dim"]    # 256
         model_dim          = m["model_dim"]             # 128 (social context dim)
         self.future_steps  = config["dataset"]["future_steps"]  # 12
+        # Ablation switch: without it the decoder gets no neighbour information.
+        self.use_social    = m.get("use_social", True)
 
         context_dim = 256   # from fusion MLP
 
@@ -116,18 +142,15 @@ class Decoder(nn.Module):
             context_dim=model_dim,
         )
 
-        # GRU input dim: prev_delta + context + goal_emb + z + social_attn
-        gru_input_dim = (
-            2                      # previous delta (dx, dy)
-            + context_dim          # 256
-            + self.goal_emb_dim    # 64
-            + self.latent_dim      # 32
-            + model_dim            # 128  (social attention output)
-        )
-
-        self.gru = nn.GRUCell(
-            input_size=gru_input_dim,
-            hidden_size=self.hidden_dim,
+        # GRU input = [prev_delta (2) || social_attn (D)]  (changes every step)
+        #           + [context (256) || goal_emb (G) || z (D_z)] (constant)
+        # The constant part's contribution to the gates is computed once per
+        # sequence instead of at every step; otherwise this is a standard GRU.
+        const_dim = context_dim + self.goal_emb_dim + self.latent_dim
+        self.gru = StaticInputGRUCell(
+            var_dim=2 + model_dim,
+            const_dim=const_dim,
+            hidden_dim=self.hidden_dim,
         )
 
         # Output head: hidden → (dx, dy)
@@ -165,7 +188,9 @@ class Decoder(nn.Module):
             teacher_forcing_ratio: float in [0,1], 0 = free-running
 
         Returns:
-            positions : (B, N, T_future, 2) — absolute predicted positions
+            positions : (B, N, T_future, 2) — positions relative to each
+                        agent's last observed position (goal_coords and
+                        future_gt must use the same convention)
         """
         B, N, _ = context.shape                                 # unpack
         T = self.future_steps                                   # 12
@@ -198,23 +223,21 @@ class Decoder(nn.Module):
         else:
             tf_flips = None
 
+        const_gates = self.gru.project_const(
+            torch.cat([ctx_flat, goal_flat, z_flat], dim=-1))  # (B*N, 3H)
+
         for t in range(T):
             # Social attention: query = current hidden, keys = social embeddings
             hidden_3d   = hidden.reshape(B, N, -1)              # (B, N, H)
-            social_ctx  = self.social_attn(hidden_3d, social_emb, mask)  # (B, N, D)
-            social_flat = social_ctx.reshape(B * N, -1)         # (B*N, D)
+            if self.use_social:
+                social_ctx = self.social_attn(hidden_3d, social_emb, mask)  # (B, N, D)
+                social_flat = social_ctx.reshape(B * N, -1)    # (B*N, D)
+            else:
+                social_flat = social_emb.new_zeros(B * N, social_emb.shape[-1])
 
-            # Assemble GRU input
-            gru_input = torch.cat([
-                prev_delta,     # (B*N, 2)
-                ctx_flat,       # (B*N, 256)
-                goal_flat,      # (B*N, G)
-                z_flat,         # (B*N, D_z)
-                social_flat,    # (B*N, D)
-            ], dim=-1)                                           # (B*N, input_dim)
-
-            # GRU step
-            hidden = self.gru(gru_input, hidden)                # (B*N, H)
+            # GRU step (constant inputs pre-projected in const_gates)
+            var_input = torch.cat([prev_delta, social_flat], dim=-1)   # (B*N, 2+D)
+            hidden = self.gru(var_input, const_gates, hidden)   # (B*N, H)
 
             # Predict delta displacement
             delta = self.output_head(hidden)                    # (B*N, 2)

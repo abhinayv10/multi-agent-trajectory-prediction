@@ -61,14 +61,18 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 class TemporalEncoder(nn.Module):
     """
-    Transformer-based encoder that produces a per-agent temporal embedding
-    from the 8-step motion history.
+    Per-agent temporal embedding of the motion history.
 
-    Architecture:
-        1. Linear projection: state_dim → model_dim
-        2. Sinusoidal positional encoding
-        3. TransformerEncoder (num_layers layers, num_heads heads)
-        4. Mean pooling over the time dimension → final embedding
+    Input positions are expected relative to each agent's own last observed
+    position (the model does this), so the encoder sees motion, not location.
+
+    Architectures (config["model"]["temporal_encoder"]):
+        transformer (default):
+            1. Linear projection: state_dim -> model_dim
+            2. Sinusoidal positional encoding
+            3. TransformerEncoder with padded history steps masked out
+            4. Masked mean pooling over time
+        lstm (ablation): single-layer LSTM, final hidden state.
 
     Args:
         config : full config dict
@@ -85,65 +89,56 @@ class TemporalEncoder(nn.Module):
         num_heads   = m["num_heads"]                            # 4
         num_layers  = m["num_transformer_layers"]               # 2
         ff_dim      = model_dim * 4                             # 512
+        self.kind   = m.get("temporal_encoder", "transformer")
+        if self.kind not in ("transformer", "lstm"):
+            raise ValueError(f"Unknown temporal_encoder '{self.kind}'")
 
-        # 1. Input projection
-        self.input_proj = nn.Linear(state_dim, model_dim)       # (state_dim) → (D)
+        self.input_proj = nn.Linear(state_dim, model_dim)       # (state_dim) -> (D)
+        if self.kind == "transformer":
+            self.pos_enc = SinusoidalPositionalEncoding(model_dim)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=model_dim,
+                nhead=num_heads,
+                dim_feedforward=ff_dim,
+                dropout=0.1,
+                batch_first=True,  # expects (batch, seq, dim)
+            )
+            self.transformer = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=num_layers,
+                enable_nested_tensor=False,
+            )
+        else:
+            self.lstm = nn.LSTM(model_dim, model_dim, batch_first=True)
 
-        # 2. Positional encoding
-        self.pos_enc = SinusoidalPositionalEncoding(model_dim)
-
-        # 3. Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=model_dim,
-            nhead=num_heads,
-            dim_feedforward=ff_dim,
-            dropout=0.1,
-            batch_first=True,  # expects (batch, seq, dim)
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
-        )
-
-        # 4. Layer norm on output
         self.norm = nn.LayerNorm(model_dim)
-
         self.to(device)
 
     def forward(
         self,
-        past: torch.Tensor,          # (B, N, T, state_dim)
-        mask: Optional[torch.Tensor] = None,  # (B, N) bool
-    ) -> torch.Tensor:               # returns (B, N, model_dim)
-        """
-        Args:
-            past : (B, N, T, state_dim) — agent histories
-            mask : (B, N) bool — True for valid agents (unused here,
-                   padding is handled by collation; kept for API consistency)
+        past: torch.Tensor,                       # (B, N, T, state_dim)
+        mask: Optional[torch.Tensor] = None,      # (B, N) bool (unused; API compat)
+        past_mask: Optional[torch.Tensor] = None, # (B, N, T) bool, True = observed
+    ) -> torch.Tensor:                            # returns (B, N, model_dim)
+        B, N, T, S = past.shape
+        x = self.input_proj(past.reshape(B * N, T, S))         # (B*N, T, D)
+        if past_mask is None:
+            pm = torch.ones(B * N, T, dtype=torch.bool, device=past.device)
+        else:
+            pm = past_mask.reshape(B * N, T).clone()
+            pm[:, -1] = True          # current step is always observed
 
-        Returns:
-            temporal_emb : (B, N, model_dim)
-        """
-        B, N, T, S = past.shape                                 # unpack
+        if self.kind == "transformer":
+            x = self.pos_enc(x)
+            x = self.transformer(x, src_key_padding_mask=~pm)  # (B*N, T, D)
+            w = pm.unsqueeze(-1).to(x.dtype)
+            x = (x * w).sum(1) / w.sum(1).clamp(min=1.0)       # masked mean
+        else:
+            # Padded steps are the oldest ones; zero them so the LSTM sees a
+            # neutral prefix, then take the final hidden state.
+            x = x * pm.unsqueeze(-1).to(x.dtype)
+            _, (h, _) = self.lstm(x)
+            x = h[-1]                                          # (B*N, D)
 
-        # Flatten batch and agent dims for parallel processing
-        x = past.reshape(B * N, T, S)                          # (B*N, T, state_dim)
-
-        # 1. Project to model dim
-        x = self.input_proj(x)                                  # (B*N, T, D)
-
-        # 2. Add positional encoding
-        x = self.pos_enc(x)                                     # (B*N, T, D)
-
-        # 3. Transformer encoding
-        x = self.transformer(x)                                 # (B*N, T, D)
-
-        # 4. Mean pool over time dimension → single embedding per agent
-        x = x.mean(dim=1)                                       # (B*N, D)
-
-        # 5. Layer norm
-        x = self.norm(x)                                        # (B*N, D)
-
-        # Reshape back to (B, N, D)
-        temporal_emb = x.reshape(B, N, -1)                     # (B, N, D)
-        return temporal_emb
+        x = self.norm(x)
+        return x.reshape(B, N, -1)                             # (B, N, D)
