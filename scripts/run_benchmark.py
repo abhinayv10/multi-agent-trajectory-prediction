@@ -181,9 +181,21 @@ def aggregate(dataset, scenes, seeds):
             summary[v]["latency_threads"] = timings[0]["threads"]
 
     os.makedirs(os.path.join(ROOT, "results"), exist_ok=True)
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True,
+                                text=True, check=True).stdout.strip()
+    except Exception:
+        commit = None
+    summary["_meta"] = {
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S"), "git_commit": commit,
+        "config": DATASETS[dataset]["config"], "seeds": seeds, "scenes": scenes,
+        "variant_overrides": VARIANTS,
+        "note": "each run's full resolved config is in runs/<dataset>/.../test.json under 'config'",
+    }
     with open(os.path.join(ROOT, "results", f"{dataset}_results.json"), "w") as fh:
         json.dump(summary, fh, indent=1)
-    md = render_markdown(dataset, scenes, seeds, summary, res)
+    md = render_markdown(dataset, scenes, seeds, {k: v for k, v in summary.items() if k != "_meta"}, res)
+    md += f"\nGenerated {summary['_meta']['generated']} from git commit {commit}.\n"
     with open(os.path.join(ROOT, "results", f"{dataset}_results.md"), "w", encoding="utf-8") as fh:
         fh.write(md)
     print(md)
