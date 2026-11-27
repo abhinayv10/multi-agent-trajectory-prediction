@@ -142,6 +142,19 @@ def load_results(dataset, scenes, variants, seeds):
     return out
 
 
+def git_commit():
+    """Short HEAD hash, with "-dirty" when tracked code or configs differ from it,
+    so a result is never credited to a commit that did not produce it."""
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        changed = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "*.py", "configs"],
+                                 cwd=ROOT).returncode != 0
+        return commit + ("-dirty" if changed else "")
+    except Exception:
+        return None
+
+
 def fmt(vals, digits=2):
     vals = [v for v in vals if v is not None and np.isfinite(v)]
     if not vals:
@@ -181,11 +194,7 @@ def aggregate(dataset, scenes, seeds):
             summary[v]["latency_threads"] = timings[0]["threads"]
 
     os.makedirs(os.path.join(ROOT, "results"), exist_ok=True)
-    try:
-        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True,
-                                text=True, check=True).stdout.strip()
-    except Exception:
-        commit = None
+    commit = git_commit()
     summary["_meta"] = {
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S"), "git_commit": commit,
         "config": DATASETS[dataset]["config"], "seeds": seeds, "scenes": scenes,

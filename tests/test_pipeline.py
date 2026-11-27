@@ -82,6 +82,31 @@ def test_variant_forward_backward(name):
     assert (lp[..., :-1] >= lp[..., 1:] - 1e-6).all()
 
 
+@pytest.mark.parametrize("name", ["ours", "no_ranking", "no_cvae", "no_goals"])
+def test_every_goal_gets_a_candidate_with_benchmark_sizes(name):
+    """Regression test (27 Nov 2026): with 6 goals and 20 candidates the old
+    goal-major pool was cut at 20, so goal 6 never got a candidate and the
+    no_ranking variant indexed candidate 20 and crashed. The small test config
+    (12 candidates) divides evenly by 6 and hid the bug, so use the real sizes."""
+    torch.manual_seed(0)
+    cfg = small_config(VARIANTS[name] + ["model.num_candidates=20", "model.num_goals=6"])
+    model = build_model(cfg, torch.device("cpu"))
+    assert model.num_pool == 20
+    used = set(model.candidate_goals().tolist())
+    assert used == set(range(model.goals_used))
+
+    batch = dummy_batch(cfg)
+    model.eval()
+    with torch.no_grad():
+        out = model(batch, teacher_forcing_ratio=0.0)        # crashed for no_ranking
+    K = cfg["model"]["num_predictions"]
+    assert out["all_candidates"].shape[2] == 20
+    assert out["predictions"].shape[2] == K
+    if name == "no_ranking":
+        # one candidate per goal, best-scored goal first
+        assert model.candidate_goals()[:K].tolist() == list(range(K))
+
+
 def test_constant_velocity_exact_on_linear_motion():
     cfg = small_config(["model.type=cv"])
     model = build_model(cfg, torch.device("cpu"))

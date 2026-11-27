@@ -101,9 +101,12 @@ class TrajectoryModel(nn.Module):
             self.goals_used = self.num_goals if self.use_cvae else self.num_candidates
         else:
             self.goals_used = 1
-        self.samples_per_goal = (math.ceil(self.num_candidates / self.goals_used)
-                                 if self.use_cvae else 1)
-        self.num_pool = min(self.num_candidates, self.goals_used * self.samples_per_goal)
+        # Candidates are assigned to goals round-robin (candidate c -> goal c % G),
+        # so every goal gets a candidate even when G does not divide the pool size.
+        # (Before 27 Nov 2026 the pool was goal-major and cut at num_candidates,
+        # which silently dropped the last goal when G=6 and C=20.)
+        self.num_pool = self.num_candidates
+        self.samples_per_goal = math.ceil(self.num_pool / self.goals_used)
         if self.num_predictions > self.num_pool:
             raise ValueError(f"num_predictions={self.num_predictions} exceeds the "
                              f"{self.num_pool} candidates this configuration generates")
@@ -196,6 +199,10 @@ class TrajectoryModel(nn.Module):
         )                                                                     # (B*G, N, T, 2)
         return traj.reshape(B, G, N, T, 2).permute(0, 2, 1, 3, 4)
 
+    def candidate_goals(self, device=None) -> torch.Tensor:
+        """Goal index (0..G-1) used by each of the num_pool candidates."""
+        return torch.arange(self.num_pool, device=device) % self.goals_used
+
     def _rank(self, candidates_rel, context, K):
         """Score candidates and select the top-K, best first.
 
@@ -207,9 +214,8 @@ class TrajectoryModel(nn.Module):
         B, N, C, T, _ = candidates_rel.shape
         if not self.use_ranking:
             # One candidate per goal in goal-score order, then second samples...
-            idx = [(i % self.goals_used) * self.samples_per_goal + i // self.goals_used
-                   for i in range(K)]
-            top_idx = torch.as_tensor(idx, device=context.device).expand(B, N, K)
+            # With round-robin order that is simply the first K candidates.
+            top_idx = torch.arange(K, device=context.device).expand(B, N, K)
             log_probs = context.new_full((B, N, K), -math.log(K))
             return top_idx, log_probs, None
 
@@ -270,9 +276,10 @@ class TrajectoryModel(nn.Module):
         else:
             goals = context.new_zeros(B, N, 1, 2)
 
-        # 3. Prior candidates, goal-major: candidate g * S + s.
-        G, S = self.goals_used, self.samples_per_goal
-        goals_c = goals.repeat_interleave(S, dim=2)[:, :, :self.num_pool]
+        # 3. Prior candidates, round-robin over goals: candidate c uses goal c % G.
+        G = self.goals_used
+        goal_of = self.candidate_goals(goals.device)
+        goals_c = goals[:, :, goal_of]
         z = None
         prior_params = post_params = None
         if self.use_cvae:
@@ -282,8 +289,7 @@ class TrajectoryModel(nn.Module):
             # The first candidate of every goal uses the prior mean: the most
             # likely trajectory for that goal, which the ranker can put first.
             mu = prior_params[0].reshape(B, N, 1, -1)
-            first = torch.zeros(self.num_pool, dtype=torch.bool, device=z.device)
-            first[::S] = True
+            first = torch.arange(self.num_pool, device=z.device) < G
             z = torch.where(first.view(1, 1, -1, 1), mu, z)
         cand_rel = self._decode(context, social_emb, mask, goals_c, z)        # (B, N, C, T, 2)
 

@@ -34,9 +34,14 @@ START, END = "<!-- ablation:start -->", "<!-- ablation:end -->"
 
 
 def git_commit():
+    """Short HEAD hash, with "-dirty" when tracked code or configs differ from it,
+    so a result is never credited to a commit that did not produce it."""
     try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True,
-                              text=True, check=True).stdout.strip()
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        changed = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "*.py", "configs"],
+                                 cwd=ROOT).returncode != 0
+        return commit + ("-dirty" if changed else "")
     except Exception:
         return None
 
