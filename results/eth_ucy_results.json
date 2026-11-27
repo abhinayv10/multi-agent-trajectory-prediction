@@ -1646,8 +1646,8 @@
   "latency_threads": 4
  },
  "_meta": {
-  "generated": "2026-11-27T13:57:29",
-  "git_commit": "d93f38f-dirty",
+  "generated": "2026-11-27T14:03:22",
+  "git_commit": "58dc879",
   "config": "configs/eth_ucy.yaml",
   "seeds": [
    0,

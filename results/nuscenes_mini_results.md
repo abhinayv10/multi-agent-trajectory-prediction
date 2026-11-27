@@ -24,4 +24,4 @@ Mean ± std over seeds [0, 1, 2] (sample std). Errors in metres; MR@6 = fraction
 | Ours, one candidate per goal | cyclist | 6 | 13.62 ± 0.64 | 25.29 ± 1.26 | 13.01 ± 0.21 | 24.13 ± 0.40 | 1.00 ± 0.00 |
 | Ours, one candidate per goal | pedestrian | 594 | 1.05 ± 0.10 | 2.07 ± 0.16 | 0.59 ± 0.05 | 1.15 ± 0.13 | 0.14 ± 0.04 |
 
-Generated 2026-11-27T13:57:38 from git commit d93f38f-dirty.
+Generated 2026-11-27T14:03:22 from git commit 58dc879.
