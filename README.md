@@ -36,9 +36,32 @@ Per scene, minADE@6 / minFDE@6:
 
 - **The plain LSTM is the strongest model here**, on every scene at best-of-6 and best-of-20 (average minFDE@6 0.76 m). The full model comes second at best-of-6 (0.87 m). It beats constant velocity on ETH and HOTEL and falls behind it on UNIV, ZARA1 and ZARA2.
 - **No learned model beats constant velocity on its top-ranked guess** (minFDE@1: 1.15 m for CV, 1.28 m for ours, 1.30 m for the LSTM). Both models learn spread-out modes for best-of-K, and their rankers do not pick the most likely one. Without the @1 column this weakness would be invisible.
-- **The extra components do not pay for themselves yet.** On ZARA1 (table below), removing the CVAE, the goal predictor or the ranking network each *lowers* minFDE@6 by 0.05–0.07 m, removing the social layer changes nothing, and only removing the Transformer makes it slightly worse (+0.04 ± 0.04 m, within seed noise). Finding out why, using validation data only, is the next step.
+- **The extra components do not pay for themselves yet.** On ZARA1 (table below), removing the CVAE, the goal predictor or the ranking network each *lowers* minFDE@6 by 0.05–0.07 m, removing the social layer changes nothing, and only removing the Transformer makes it slightly worse (+0.04 ± 0.04 m, within seed noise). The validation analysis below finds the main reason.
 - **Comparison with published work.** On the same split files, Social-GAN reports a best-of-20 of 0.58 / 1.18 m (Gupta et al., CVPR 2018). Every method here is below that, *including constant velocity with sampled variations* (0.42 / 0.86 m). So this comparison says more about evaluation details than about the models, and it should not be read as beating Social-GAN.
 - **Note on constant velocity:** Schöller et al. (RA-L 2020) report lower constant-velocity errors (0.39 / 0.83). Their table also re-evaluates Social-GAN at 0.59 m ADE on ETH, against 0.81 m in the Social-GAN paper, so their test pipeline differs from the split files used here. Their numbers are not directly comparable.
+
+### Why the full model loses (validation data only)
+
+`scripts/investigate_ranking.py` loads every trained full model and LSTM (5 scenes × 3 seeds) and looks inside their predictions on the **validation** split; the test split is not read. It compares different ways of choosing predictions from the *same* 20 candidates. Means over the 15 runs, in metres ([`results/investigation_val_2026-11-27.json`](results/investigation_val_2026-11-27.json)):
+
+| | Full model | LSTM |
+|---|---|---|
+| minFDE@6, the model's own top 6 | 0.754 | **0.629** |
+| minFDE@6, one candidate per goal (first 6) | **0.667** | 0.751 |
+| minFDE@6, 6 candidates at random | 0.676 | 0.786 |
+| minFDE@20, best of all 20 | 0.452 | **0.381** |
+| spread of the chosen 6 (mean distance between end points) | 0.55 | 1.17 |
+| FDE of the top-1 prediction (constant velocity: 1.002) | 1.132 | 1.112 |
+| top-1 is among the 3 best of 20 (chance: 15%) | 29% | 44% |
+| top-1 travels less far than the truth (constant velocity: 44%) | 59% | 62% |
+
+What this shows:
+
+1. **The ranking network chooses a worse set of six than picking at random** (0.754 vs 0.676 m). It scores each candidate on its own, so its top six crowd around one guess: their end points are only 0.55 m apart on average, against 0.95 m for one candidate per goal. A best-of-6 set needs spread. This matches the ablation, where the "− ranking network" variant (one candidate per goal) was the best. The LSTM's ranking does work (0.629 vs 0.786 at random), because its 20 modes are trained to be different from each other.
+2. **Choosing one candidate per goal would close most of the gap to the LSTM** (0.667 vs 0.629 m, against 0.754 now). This is a change in how predictions are chosen, not a re-training. It has not been applied to the test results yet.
+3. **The candidates themselves are also somewhat worse** than the LSTM's (best of 20: 0.452 vs 0.381 m), so better selection alone would not make the full model win.
+4. **Both learned models' top-1 predictions stop short.** In 59–62% of moving agents the top-1 prediction travels less far than the person really does (median 91–92% of the true distance), while constant velocity is close to unbiased (44%, median 102%). A model that is uncertain about direction hedges by predicting a shorter path, which costs it against constant velocity on the many people who simply keep walking. No selection rule tried here beats constant velocity on top-1.
+5. **Not under-training.** Validation error improved by only about 0.3% per epoch over the last epochs, with the learning rate already decayed to 1e-5, so longer training would likely change little (not tested).
 
 ### Ablations (ZARA1, 3 seeds each, same protocol as the full model)
 
@@ -145,7 +168,7 @@ python -m venv .venv && .venv/Scripts/activate      # or source .venv/bin/activa
 pip install -r requirements.txt
 
 python scripts/download_eth_ucy.py                  # ~10 MB, Social-GAN split files
-python -m pytest tests -q                           # 22 fast checks, no GPU needed
+python -m pytest tests -q                           # 25 fast checks, no GPU needed
 
 # The exact commands behind every table above (resumable; finished runs are skipped).
 # Ablations first: the second command re-aggregates the full ETH/UCY table.
@@ -154,6 +177,7 @@ python scripts/run_benchmark.py --variants cv lstm ours
 python scripts/run_benchmark.py --dataset nuscenes_mini --variants cv lstm ours
 python scripts/ablation_table.py --scene zara1 --seeds 0 1 2   # refresh the ablation table in this README
 python scripts/run_benchmark.py --aggregate-only    # rebuild results/*.md from finished runs
+python scripts/investigate_ranking.py               # validation-only analysis of ranking and top-1 bias
 python scripts/export_checkpoints.py                # copy slim seed-0 checkpoints into release/
 ```
 
@@ -213,7 +237,7 @@ models/             temporal_encoder, social_gat, map_encoder, goal_predictor, c
                     trajectory (full model + ablation switches), baselines (CV, LSTM)
 utils/              losses, metrics (per-agent @K errors), preprocessing, config overrides
 train.py eval.py inference.py
-scripts/            download_eth_ucy, run_benchmark, analyze_failures, make_gif, ablation_table,
+scripts/            download_eth_ucy, run_benchmark, analyze_failures, make_gif, ablation_table, investigate_ranking,
                     export_checkpoints
 tests/              pipeline invariants (every variant trains; CV is exact on linear motion; padding
                     agents do not change real predictions; @1 uses the top-ranked mode; ...)
