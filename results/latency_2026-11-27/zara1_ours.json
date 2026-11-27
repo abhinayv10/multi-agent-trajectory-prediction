@@ -1,0 +1,129 @@
+{
+ "split": "test",
+ "ks": [
+  1,
+  6,
+  20
+ ],
+ "overall": {
+  "min_ade_1": 0.6153639554977417,
+  "min_fde_1": 1.2910373210906982,
+  "miss_rate_1": 0.1464346349745331,
+  "min_ade_6": 0.3593314588069916,
+  "min_fde_6": 0.7608731985092163,
+  "miss_rate_6": 0.06578947368421052,
+  "min_ade_20": 0.23192815482616425,
+  "min_fde_20": 0.43732622265815735,
+  "miss_rate_20": 0.02631578947368421
+ },
+ "by_type": {
+  "pedestrian": {
+   "count": 2356,
+   "min_ade_1": 0.6153639554977417,
+   "min_fde_1": 1.2910373210906982,
+   "miss_rate_1": 0.1464346349745331,
+   "min_ade_6": 0.3593314588069916,
+   "min_fde_6": 0.7608731985092163,
+   "miss_rate_6": 0.06578947368421052,
+   "min_ade_20": 0.23192815482616425,
+   "min_fde_20": 0.43732622265815735,
+   "miss_rate_20": 0.02631578947368421
+  }
+ },
+ "timing": {
+  "ms_per_scene_mean": 7.800726998830214,
+  "ms_per_scene_p95": 9.702339908108113,
+  "agents_per_scene_mean": 3.425,
+  "scenes_timed": 200,
+  "device": "cpu",
+  "threads": 4
+ },
+ "checkpoint": "runs/eth_ucy/zara1/ours/seed0/best.pt",
+ "n_scenes": 705,
+ "config": {
+  "dataset": {
+   "type": "eth_ucy",
+   "data_root": "data/eth_ucy",
+   "test_scene": "zara1",
+   "dt": 0.4,
+   "past_steps": 8,
+   "future_steps": 12,
+   "num_agents_max": null,
+   "augment_rotation": true,
+   "train_window_stride": 2,
+   "polyline_points": 20
+  },
+  "model": {
+   "type": "trajectory",
+   "model_dim": 128,
+   "num_heads": 4,
+   "num_transformer_layers": 2,
+   "latent_dim": 32,
+   "num_goals": 6,
+   "num_candidates": 20,
+   "num_predictions": 6,
+   "state_dim": 4,
+   "goal_embed_dim": 64,
+   "decoder_hidden_dim": 128,
+   "gat_heads": 4,
+   "gat_layers": 2,
+   "edge_dim": 3,
+   "temporal_encoder": "transformer",
+   "use_social": true,
+   "use_map": true,
+   "use_cvae": true,
+   "use_goals": true,
+   "use_ranking": true,
+   "lstm_hidden": 128,
+   "lstm_modes": 20
+  },
+  "baseline": {
+   "heading_noise_deg": 25.0
+  },
+  "training": {
+   "seed": 0,
+   "epochs": 15,
+   "warmup_epochs": 2,
+   "batch_size": 32,
+   "learning_rate": 0.001,
+   "weight_decay": 0.0,
+   "grad_clip": 1.0,
+   "num_workers": 0,
+   "max_agents_per_batch": 256,
+   "teacher_forcing_ratio": 0.5,
+   "teacher_forcing_min": 0.0,
+   "teacher_forcing_decay_epochs": 10,
+   "kl_anneal_epochs": 8,
+   "early_stopping_patience": 6,
+   "max_batches_per_epoch": null,
+   "checkpoint_path": "C:\\Users\\abhin\\Desktop\\Projects\\multi-agent-trajectory-prediction-master\\runs\\eth_ucy\\zara1\\ours\\seed0\\best.pt",
+   "diversity_clamp": 3.0,
+   "rank_temperature": 0.2,
+   "loss_weights": {
+    "min_ade": 1.0,
+    "min_fde": 1.0,
+    "recon": 1.0,
+    "goal": 0.5,
+    "kl": 0.1,
+    "diversity": 0.0,
+    "rank": 1.0,
+    "nll": 0.0
+   }
+  },
+  "evaluation": {
+   "ks": [
+    1,
+    6,
+    20
+   ],
+   "miss_threshold": 2.0,
+   "seed": 0,
+   "timing_scenes": 200
+  },
+  "logging": {
+   "use_wandb": false,
+   "project_name": "trajectory",
+   "log_every": 1
+  }
+ }
+}

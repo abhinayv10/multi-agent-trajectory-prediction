@@ -1,16 +1,40 @@
 # Results: eth_ucy
 
-Mean ± std over seeds [0] (sample std). Errors in metres; MR@6 = fraction of agents with minFDE@6 > 2 m. Predictions are ranked by model confidence, so @1 is the top-ranked mode.
+Mean ± std over seeds [0, 1, 2] (sample std). Errors in metres; MR@6 = fraction of agents with minFDE@6 > 2 m. Predictions are ranked by model confidence, so @1 is the top-ranked mode.
 
 ## Main comparison (average over test scenes)
 
 | Method | minADE@1 | minFDE@1 | minADE@6 | minFDE@6 | MR@6 | minADE@20 | minFDE@20 | ms / scene |
 |---|---|---|---|---|---|---|---|---|
-| Constant velocity | 0.43 | 0.95 | 0.34 | 0.73 | 0.05 | 0.30 | 0.61 | 0.1 |
-| LSTM enc-dec | 0.43 | 0.97 | 0.31 | 0.65 | 0.05 | 0.20 | 0.37 | 15.6 |
-| Ours (full) | 0.80 | 1.63 | 0.40 | 0.84 | 0.08 | 0.25 | 0.48 | 38.7 |
+| Constant velocity | 0.53 ± 0.00 | 1.15 ± 0.00 | 0.45 ± 0.00 | 0.95 ± 0.00 | 0.13 ± 0.00 | 0.42 ± 0.00 | 0.86 ± 0.00 | 0.1 |
+| LSTM enc-dec | 0.61 ± 0.02 | 1.30 ± 0.04 | 0.39 ± 0.01 | 0.76 ± 0.03 | 0.10 ± 0.00 | 0.26 ± 0.01 | 0.44 ± 0.01 | 9.1 |
+| Ours (full) | 0.64 ± 0.02 | 1.28 ± 0.00 | 0.45 ± 0.01 | 0.87 ± 0.05 | 0.12 ± 0.01 | 0.31 ± 0.01 | 0.56 ± 0.03 | 47.9 |
 | *Ablations* | | | | | | | | |
-| - Transformer (LSTM encoder) | 0.71 | 1.44 | 0.39 | 0.82 | 0.07 | 0.25 | 0.46 | 26.2 |
-| - social (GAT + decoder attn) | 0.76 | 1.57 | 0.40 | 0.85 | 0.07 | 0.25 | 0.49 | 20.1 |
-| - CVAE | 0.81 | 1.64 | 0.37 | 0.77 | 0.06 | 0.27 | 0.50 | 15.0 |
-| - goal predictor | 0.60 | 1.28 | 0.34 | 0.71 | 0.06 | 0.24 | 0.45 | 7.5 |
+| - Transformer (LSTM encoder) | - | - | - | - | - | - | - | 16.5 |
+| - social (GAT + decoder attn) | - | - | - | - | - | - | - | 8.8 |
+| - CVAE | - | - | - | - | - | - | - | 18.2 |
+| - goal predictor | - | - | - | - | - | - | - | 11.4 |
+| - ranking network | - | - | - | - | - | - | - | 11.7 |
+
+## Per scene: minADE@6 / minFDE@6
+
+| Method | ETH | HOTEL | UNIV | ZARA1 | ZARA2 | AVG |
+|---|---|---|---|---|---|---|
+| Constant velocity | 0.98 ± 0.00 / 2.06 ± 0.01 | 0.27 ± 0.00 / 0.51 ± 0.00 | 0.42 ± 0.00 / 0.91 ± 0.00 | 0.34 ± 0.00 / 0.72 ± 0.00 | 0.26 ± 0.00 / 0.55 ± 0.00 | 0.45 ± 0.00 / 0.95 ± 0.00 |
+| LSTM enc-dec | 0.80 ± 0.02 / 1.53 ± 0.05 | 0.21 ± 0.02 / 0.39 ± 0.09 | 0.39 ± 0.01 / 0.75 ± 0.01 | 0.31 ± 0.01 / 0.64 ± 0.02 | 0.25 ± 0.04 / 0.52 ± 0.08 | 0.39 ± 0.01 / 0.76 ± 0.03 |
+| Ours (full) | 0.84 ± 0.04 / 1.57 ± 0.21 | 0.25 ± 0.01 / 0.44 ± 0.03 | 0.50 ± 0.00 / 1.01 ± 0.02 | 0.36 ± 0.00 / 0.76 ± 0.01 | 0.27 ± 0.01 / 0.58 ± 0.01 | 0.45 ± 0.01 / 0.87 ± 0.05 |
+| - Transformer (LSTM encoder) | - / - | - / - | - / - | 0.39 ± 0.03 / 0.79 ± 0.04 | - / - | - / - |
+| - social (GAT + decoder attn) | - / - | - / - | - / - | 0.36 ± 0.00 / 0.75 ± 0.01 | - / - | - / - |
+| - CVAE | - / - | - / - | - / - | 0.34 ± 0.00 / 0.70 ± 0.01 | - / - | - / - |
+| - goal predictor | - / - | - / - | - / - | 0.33 ± 0.01 / 0.70 ± 0.01 | - / - | - / - |
+| - ranking network | - / - | - / - | - / - | 0.34 ± 0.02 / 0.68 ± 0.02 | - / - | - / - |
+
+## Per scene: minADE@20 / minFDE@20 (the protocol most ETH/UCY papers report)
+
+| Method | ETH | HOTEL | UNIV | ZARA1 | ZARA2 | AVG |
+|---|---|---|---|---|---|---|
+| Constant velocity | 0.93 ± 0.00 / 1.96 ± 0.00 | 0.24 ± 0.00 / 0.46 ± 0.00 | 0.39 ± 0.00 / 0.82 ± 0.00 | 0.30 ± 0.00 / 0.61 ± 0.00 | 0.23 ± 0.00 / 0.47 ± 0.00 | 0.42 ± 0.00 / 0.86 ± 0.00 |
+| LSTM enc-dec | 0.48 ± 0.02 / 0.75 ± 0.06 | 0.15 ± 0.01 / 0.25 ± 0.04 | 0.28 ± 0.01 / 0.49 ± 0.02 | 0.22 ± 0.03 / 0.40 ± 0.05 | 0.16 ± 0.03 / 0.30 ± 0.08 | 0.26 ± 0.01 / 0.44 ± 0.01 |
+| Ours (full) | 0.66 ± 0.04 / 1.13 ± 0.12 | 0.18 ± 0.01 / 0.30 ± 0.03 | 0.30 ± 0.00 / 0.58 ± 0.00 | 0.24 ± 0.01 / 0.45 ± 0.01 | 0.18 ± 0.01 / 0.34 ± 0.02 | 0.31 ± 0.01 / 0.56 ± 0.03 |
+
+Generated 2026-11-27T12:37:32 from git commit 75e4dcb.
