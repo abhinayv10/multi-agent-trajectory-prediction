@@ -107,6 +107,31 @@ def test_every_goal_gets_a_candidate_with_benchmark_sizes(name):
         assert model.candidate_goals()[:K].tolist() == list(range(K))
 
 
+def test_per_goal_selection_takes_one_candidate_per_goal_at_inference():
+    """selection=per_goal returns the first K candidates (one per goal) at
+    inference, but training still scores every candidate with the ranker."""
+    torch.manual_seed(0)
+    cfg = small_config(["model.num_candidates=20", "model.num_goals=6", "model.selection=per_goal"])
+    model = build_model(cfg, torch.device("cpu"))
+    batch = dummy_batch(cfg)
+    K = cfg["model"]["num_predictions"]
+
+    model.eval()
+    with torch.no_grad():
+        out = model(batch, teacher_forcing_ratio=0.0)
+    assert torch.equal(out["predictions"], out["all_candidates"][:, :, :K])
+    assert out["all_log_probs"] is not None                  # ranker still runs
+    assert model.candidate_goals()[:K].tolist() == list(range(K))
+
+    model.train()
+    out = model(batch, teacher_forcing_ratio=0.5)
+    loss, parts = compute_total_loss(out, batch, cfg, epoch=3)
+    assert "rank" in parts and torch.isfinite(loss)          # ranker is still trained
+
+    with pytest.raises(ValueError):
+        build_model(small_config(["model.selection=nonsense"]), torch.device("cpu"))
+
+
 def test_constant_velocity_exact_on_linear_motion():
     cfg = small_config(["model.type=cv"])
     model = build_model(cfg, torch.device("cpu"))

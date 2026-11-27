@@ -49,13 +49,20 @@ VARIANTS = {
     "no_cvae":        ["model.use_cvae=false"],
     "no_goals":       ["model.use_goals=false"],
     "no_ranking":     ["model.use_ranking=false"],
+    "ours_per_goal":  [],
 }
-MAIN_VARIANTS = ["cv", "lstm", "ours"]
+# Evaluation-only variants: re-evaluate another variant's trained checkpoint
+# with different inference settings (no training of their own).
+EVAL_ONLY = {
+    "ours_per_goal": ("ours", ["model.selection=per_goal"]),
+}
+MAIN_VARIANTS = ["cv", "lstm", "ours", "ours_per_goal"]
 ABLATIONS = ["ours", "no_transformer", "no_social", "no_cvae", "no_goals", "no_ranking"]
 LABELS = {
     "cv": "Constant velocity",
     "lstm": "LSTM enc-dec",
     "ours": "Ours (full)",
+    "ours_per_goal": "Ours, one candidate per goal",
     "no_transformer": "- Transformer (LSTM encoder)",
     "no_social": "- social (GAT + decoder attn)",
     "no_cvae": "- CVAE",
@@ -100,7 +107,12 @@ def job(args, dataset, cfg_path, scene, variant, seed):
     key = f"{scene or dataset}/{variant}/seed{seed}"
     t0 = time.time()
 
-    if variant != "cv" and not args.eval_only and not os.path.isfile(done):
+    eval_set = []
+    if variant in EVAL_ONLY:
+        base, eval_set = EVAL_ONLY[variant]
+        ckpt = os.path.join(run_dir(dataset, scene, base, seed), "best.pt")
+
+    if variant != "cv" and variant not in EVAL_ONLY and not args.eval_only and not os.path.isfile(done):
         cmd = [sys.executable, "train.py", "--config", cfg_path, "--seed", str(seed),
                "--checkpoint", ckpt, "--threads", str(args.threads), "--set", *overrides]
         if run(cmd, log) != 0:
@@ -116,7 +128,7 @@ def job(args, dataset, cfg_path, scene, variant, seed):
         if not os.path.isfile(ckpt):
             return key, "no checkpoint"
         cmd = [sys.executable, "eval.py", "--checkpoint", ckpt, "--threads", str(args.threads),
-               "--out", result, "--set", f"evaluation.seed={seed}"]
+               "--out", result, "--set", f"evaluation.seed={seed}", *eval_set]
     if run(cmd, log) != 0:
         return key, f"EVAL FAILED (see {log})"
     return key, f"ok ({(time.time() - t0) / 60:.1f} min)"

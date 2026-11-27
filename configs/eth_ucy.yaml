@@ -34,6 +34,7 @@ model:
   use_cvae: true
   use_goals: true
   use_ranking: true
+  selection: ranker             # ranker | per_goal (inference only)
   # --- LSTM baseline ---
   lstm_hidden: 128
   lstm_modes: 20

@@ -33,6 +33,9 @@ Ablation switches (config["model"]):
     use_cvae         : latent sampling (off -> one deterministic decode per goal)
     use_goals        : goal predictor (off -> CVAE samples only)
     use_ranking      : learned ranking (off -> one sample per goal, by goal score)
+    selection        : "ranker" (top-K by ranking score) | "per_goal" (one candidate
+                       per goal in goal-score order; inference only, the ranker is
+                       still trained). See scripts/investigate_ranking.py.
 
 Outputs:
     dict with predictions (B, N, K, T, 2) sorted by confidence (scene frame),
@@ -92,6 +95,9 @@ class TrajectoryModel(nn.Module):
         self.use_cvae    = m.get("use_cvae", True)
         self.use_goals   = m.get("use_goals", True)
         self.use_ranking = m.get("use_ranking", True)
+        self.selection   = m.get("selection", "ranker")
+        if self.selection not in ("ranker", "per_goal"):
+            raise ValueError(f"model.selection must be 'ranker' or 'per_goal', got {self.selection!r}")
         if not (self.use_cvae or self.use_goals):
             raise ValueError("use_cvae and use_goals cannot both be off: "
                              "the model would have no source of multi-modality.")
@@ -225,6 +231,12 @@ class TrajectoryModel(nn.Module):
         h = self.rank_traj(traj_flat) + self.rank_ctx(context).unsqueeze(2)    # (B, N, C, 128)
         scores = self.rank_head(h).squeeze(-1)                                 # (B, N, C)
         log_probs_all = F.log_softmax(scores, dim=-1)                          # (B, N, C)
+        if self.selection == "per_goal" and not self.training:
+            # Same order as without the ranker. The ranking scores of a set of
+            # near-identical candidates make a poor best-of-K set (validation
+            # analysis, 27 Nov 2026), so at inference take one per goal instead.
+            top_idx = torch.arange(K, device=context.device).expand(B, N, K)
+            return top_idx, context.new_full((B, N, K), -math.log(K)), log_probs_all
         _, top_idx = scores.topk(K, dim=-1)                                    # sorted
         return top_idx, log_probs_all.gather(2, top_idx), log_probs_all
 

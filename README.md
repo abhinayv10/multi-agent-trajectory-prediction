@@ -12,7 +12,7 @@ Every number on this page comes from `runs/**/test.json`, aggregated into [`resu
 
 *Full model (seed 0) on the held-out ZARA1 scene. Blue = observed 3.2 s, green = true 4.8 s, orange = the top 3 predictions (thick = top-ranked).*
 
-> **How much to trust these numbers.** Every row uses the full protocol: 3 seeds, up to 15 epochs, early stopping after 6 epochs without improvement, and the checkpoint chosen on validation data only. The ablations were run on ZARA1 only. Two caveats. In 7 of the 15 ETH/UCY full-model runs the best checkpoint came from epoch 14 or 15, so the model may be under-trained at this budget; that has not been tested. ETH seed 2 early-stopped at epoch 7 (best epoch 2), which is why its spread is larger.
+> **How much to trust these numbers.** Every row uses the full protocol: 3 seeds, up to 15 epochs, early stopping after 6 epochs without improvement, and the checkpoint chosen on validation data only. The ablations were run on ZARA1 only. Two caveats. In 7 of the 15 ETH/UCY full-model runs the best checkpoint came from epoch 14 or 15, but validation error was then improving by only about 0.3% per epoch, so longer training would likely change little (not tested). ETH seed 2 early-stopped at epoch 7 (best epoch 2), which is why its spread is larger. The "one candidate per goal" rows use the same trained models as "Ours", with a selection rule chosen on validation data (see below).
 
 ### ETH/UCY: average over the five leave-one-scene-out splits
 
@@ -22,7 +22,8 @@ Every number on this page comes from `runs/**/test.json`, aggregated into [`resu
 |---|---|---|---|---|---|---|---|---|
 | Constant velocity | 3 | **0.53** | **1.15** | 0.45 | 0.95 | 0.13 | 0.42 | 0.86 |
 | LSTM enc-dec (20 modes) | 3 | 0.61 ± 0.02 | 1.30 ± 0.04 | **0.39 ± 0.01** | **0.76 ± 0.03** | **0.10 ± 0.00** | **0.26 ± 0.01** | **0.44 ± 0.01** |
-| Ours, full model | 3 | 0.64 ± 0.02 | 1.28 ± 0.00 | 0.45 ± 0.01 | 0.87 ± 0.05 | 0.12 ± 0.01 | 0.31 ± 0.01 | 0.56 ± 0.03 |
+| Ours, full model (ranker picks the top 6) | 3 | 0.64 ± 0.02 | 1.28 ± 0.00 | 0.45 ± 0.01 | 0.87 ± 0.05 | 0.12 ± 0.01 | 0.31 ± 0.01 | 0.56 ± 0.03 |
+| Ours, one candidate per goal | 3 | 0.61 ± 0.04 | 1.23 ± 0.06 | 0.41 ± 0.01 | 0.80 ± 0.03 | **0.10 ± 0.01** | 0.31 ± 0.01 | 0.56 ± 0.03 |
 
 Per scene, minADE@6 / minFDE@6:
 
@@ -30,12 +31,14 @@ Per scene, minADE@6 / minFDE@6:
 |---|---|---|---|---|---|
 | Constant velocity | 0.98 / 2.06 | 0.27 / 0.51 | 0.42 / 0.91 | 0.34 / 0.72 | 0.26 / 0.55 |
 | LSTM enc-dec | **0.80 ± 0.02 / 1.53 ± 0.05** | **0.21 ± 0.02 / 0.39 ± 0.09** | **0.39 ± 0.01 / 0.75 ± 0.01** | **0.31 ± 0.01 / 0.64 ± 0.02** | **0.25 ± 0.04 / 0.52 ± 0.08** |
-| Ours | 0.84 ± 0.04 / 1.57 ± 0.21 | 0.25 ± 0.01 / 0.44 ± 0.03 | 0.50 ± 0.00 / 1.01 ± 0.02 | 0.36 ± 0.00 / 0.76 ± 0.01 | 0.27 ± 0.01 / 0.58 ± 0.01 |
+| Ours (ranker) | 0.84 ± 0.04 / 1.57 ± 0.21 | 0.25 ± 0.01 / 0.44 ± 0.03 | 0.50 ± 0.00 / 1.01 ± 0.02 | 0.36 ± 0.00 / 0.76 ± 0.01 | 0.27 ± 0.01 / 0.58 ± 0.01 |
+| Ours, one candidate per goal | 0.82 ± 0.01 / 1.52 ± 0.07 | 0.25 ± 0.01 / 0.45 ± 0.03 | 0.41 ± 0.00 / 0.83 ± 0.01 | 0.33 ± 0.01 / 0.68 ± 0.02 | 0.25 ± 0.02 / **0.51 ± 0.03** |
 
 **Reading the results**
 
-- **The plain LSTM is the strongest model here**, on every scene at best-of-6 and best-of-20 (average minFDE@6 0.76 m). The full model comes second at best-of-6 (0.87 m). It beats constant velocity on ETH and HOTEL and falls behind it on UNIV, ZARA1 and ZARA2.
-- **No learned model beats constant velocity on its top-ranked guess** (minFDE@1: 1.15 m for CV, 1.28 m for ours, 1.30 m for the LSTM). Both models learn spread-out modes for best-of-K, and their rankers do not pick the most likely one. Without the @1 column this weakness would be invisible.
+- **The plain LSTM is the strongest model here** (average minFDE@6 0.76 m), best on every scene at best-of-20 and on four of five at best-of-6. With the ranker choosing its predictions, the full model reaches 0.87 m and beats constant velocity only on ETH and HOTEL.
+- **Choosing one candidate per goal instead improves the same trained models to 0.80 m** (ranker: 0.87 m) and beats constant velocity on all five scenes. It still trails the LSTM (0.76 m) except on ZARA2, where the two are within noise (0.51 ± 0.03 vs 0.52 ± 0.08). The rule was chosen on validation data before the test set was evaluated with it.
+- **No learned model beats constant velocity on its top-ranked guess** (minFDE@1: 1.15 m for CV, 1.23 m for ours with one candidate per goal, 1.28 m with the ranker, 1.30 m for the LSTM). Both models learn spread-out modes for best-of-K, and their rankers do not pick the most likely one. Without the @1 column this weakness would be invisible.
 - **The extra components do not pay for themselves yet.** On ZARA1 (table below), removing the CVAE, the goal predictor or the ranking network each *lowers* minFDE@6 by 0.05–0.07 m, removing the social layer changes nothing, and only removing the Transformer makes it slightly worse (+0.04 ± 0.04 m, within seed noise). The validation analysis below finds the main reason.
 - **Comparison with published work.** On the same split files, Social-GAN reports a best-of-20 of 0.58 / 1.18 m (Gupta et al., CVPR 2018). Every method here is below that, *including constant velocity with sampled variations* (0.42 / 0.86 m). So this comparison says more about evaluation details than about the models, and it should not be read as beating Social-GAN.
 - **Note on constant velocity:** Schöller et al. (RA-L 2020) report lower constant-velocity errors (0.39 / 0.83). Their table also re-evaluates Social-GAN at 0.59 m ADE on ETH, against 0.81 m in the Social-GAN paper, so their test pipeline differs from the split files used here. Their numbers are not directly comparable.
@@ -58,7 +61,7 @@ Per scene, minADE@6 / minFDE@6:
 What this shows:
 
 1. **The ranking network chooses a worse set of six than picking at random** (0.754 vs 0.676 m). It scores each candidate on its own, so its top six crowd around one guess: their end points are only 0.55 m apart on average, against 0.95 m for one candidate per goal. A best-of-6 set needs spread. This matches the ablation, where the "− ranking network" variant (one candidate per goal) was the best. The LSTM's ranking does work (0.629 vs 0.786 at random), because its 20 modes are trained to be different from each other.
-2. **Choosing one candidate per goal would close most of the gap to the LSTM** (0.667 vs 0.629 m, against 0.754 now). This is a change in how predictions are chosen, not a re-training. It has not been applied to the test results yet.
+2. **Choosing one candidate per goal closes most of the gap to the LSTM** on validation (0.667 vs 0.629 m, against 0.754 with the ranker). This changes how predictions are chosen, not the training: `model.selection=per_goal` at inference. Applied afterwards to the test set, it gives the "one candidate per goal" rows above (minFDE@6 0.87 → 0.80 m on ETH/UCY, 1.29 → 1.15 m on nuScenes pedestrians).
 3. **The candidates themselves are also somewhat worse** than the LSTM's (best of 20: 0.452 vs 0.381 m), so better selection alone would not make the full model win.
 4. **Both learned models' top-1 predictions stop short.** In 59–62% of moving agents the top-1 prediction travels less far than the person really does (median 91–92% of the true distance), while constant velocity is close to unbiased (44%, median 102%). A model that is uncertain about direction hedges by predicting a shorter path, which costs it against constant velocity on the many people who simply keep walking. No selection rule tried here beats constant velocity on top-1.
 5. **Not under-training.** Validation error improved by only about 0.3% per epoch over the last epochs, with the learning rate already decayed to 1e-5, so longer training would likely change little (not tested).
@@ -113,12 +116,14 @@ The common thread is that the worst errors come from **changes of intent** (star
 |---|---|---|---|---|---|---|---|---|
 | Constant velocity | 3 | pedestrian | 594 | **0.67** | **1.47** | 0.52 | 1.06 | 0.15 |
 | LSTM enc-dec | 3 | pedestrian | 594 | 0.88 ± 0.09 | 1.82 ± 0.16 | **0.49 ± 0.02** | **0.91 ± 0.06** | **0.09 ± 0.03** |
-| Ours | 3 | pedestrian | 594 | 1.04 ± 0.03 | 2.07 ± 0.06 | 0.64 ± 0.04 | 1.29 ± 0.09 | 0.18 ± 0.01 |
+| Ours (ranker) | 3 | pedestrian | 594 | 1.04 ± 0.03 | 2.07 ± 0.06 | 0.64 ± 0.04 | 1.29 ± 0.09 | 0.18 ± 0.01 |
+| Ours, one candidate per goal | 3 | pedestrian | 594 | 1.05 ± 0.10 | 2.07 ± 0.16 | 0.59 ± 0.05 | 1.15 ± 0.13 | 0.14 ± 0.04 |
 | Constant velocity | 3 | cyclist | 6 | **0.93** | **1.82** | **0.93** | **1.82** | **0.50** |
 | LSTM enc-dec | 3 | cyclist | 6 | 12.77 ± 0.14 | 24.21 ± 0.26 | 12.77 ± 0.14 | 24.21 ± 0.26 | 1.00 |
-| Ours | 3 | cyclist | 6 | 14.24 ± 1.83 | 26.46 ± 3.60 | 13.19 ± 0.25 | 24.47 ± 0.56 | 1.00 |
+| Ours (ranker) | 3 | cyclist | 6 | 14.24 ± 1.83 | 26.46 ± 3.60 | 13.19 ± 0.25 | 24.47 ± 0.56 | 1.00 |
+| Ours, one candidate per goal | 3 | cyclist | 6 | 13.62 ± 0.64 | 25.29 ± 1.26 | 13.01 ± 0.21 | 24.13 ± 0.40 | 1.00 |
 
-The full model has 1.4M parameters but only 141 training samples here (1,501 target pedestrians, 46 cyclists), and it is the weakest model on pedestrians. The cyclist rows are one cyclist seen in 6 consecutive keyframes, riding at 5.0–5.5 m/s, faster than every cyclist in the training data (max 4.9 m/s). An end-point error of about 24 m on a path of roughly 30 m means both learned models predict the cyclist covering only a fraction of the distance. Whether that is only the unseen speed, or also a data problem, has not been checked yet. With 8 training scenes, nuScenes-mini can show that the pipeline works but cannot rank models.
+The full model has 1.4M parameters but only 141 training samples here (1,501 target pedestrians, 46 cyclists), and it is the weakest model on pedestrians, with either selection rule. The cyclist rows are one cyclist seen in 6 consecutive keyframes, riding at 5.0–5.5 m/s, faster than every cyclist in the training data (max 4.9 m/s). An end-point error of about 24 m on a path of roughly 30 m means both learned models predict the cyclist covering only a fraction of the distance. Whether that is only the unseen speed, or also a data problem, has not been checked yet. With 8 training scenes, nuScenes-mini can show that the pipeline works but cannot rank models.
 
 ### Inference time
 
@@ -168,13 +173,15 @@ python -m venv .venv && .venv/Scripts/activate      # or source .venv/bin/activa
 pip install -r requirements.txt
 
 python scripts/download_eth_ucy.py                  # ~10 MB, Social-GAN split files
-python -m pytest tests -q                           # 25 fast checks, no GPU needed
+python -m pytest tests -q                           # 26 fast checks, no GPU needed
 
 # The exact commands behind every table above (resumable; finished runs are skipped).
 # Ablations first: the second command re-aggregates the full ETH/UCY table.
 python scripts/run_benchmark.py --scenes zara1 --variants no_transformer no_social no_cvae no_goals no_ranking
 python scripts/run_benchmark.py --variants cv lstm ours
+python scripts/run_benchmark.py --variants ours_per_goal   # re-evaluates ours with model.selection=per_goal (no training)
 python scripts/run_benchmark.py --dataset nuscenes_mini --variants cv lstm ours
+python scripts/run_benchmark.py --dataset nuscenes_mini --variants ours_per_goal
 python scripts/ablation_table.py --scene zara1 --seeds 0 1 2   # refresh the ablation table in this README
 python scripts/run_benchmark.py --aggregate-only    # rebuild results/*.md from finished runs
 python scripts/investigate_ranking.py               # validation-only analysis of ranking and top-1 bias
